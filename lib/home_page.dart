@@ -2,11 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
+import 'package:latlong2/latlong.dart';
 import 'api_service.dart';
 import 'login_page.dart';
-
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -16,69 +16,76 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  static const _green = Color(0xFF16A34A);
+  static const _lahoreCenter = LatLng(31.5204, 74.3587);
+
   final _api = ApiService();
-  final _mapController = MapController();
+  late MapController _mapController;
+  bool _mapReady = false;
 
   List<dynamic> _hospitals = [];
   List<dynamic> _emergencyTypes = [];
   List<dynamic> _triageCodes = [];
   Map<String, dynamic>? _myAmbulance;
+  /// Always from GET /ambulances/mine — never hardcode another unit.
+  String? _ambulanceId;
   Map<String, dynamic>? _activeTransit;
-
-  String? _selectedHospitalId;
-  String? _selectedEmergencyTypeId;
-  String? _selectedTriageCodeId;
-  final PageController _pageController = PageController();
-  final TextEditingController _searchController = TextEditingController();
-  int _currentStep = 0;
-  String _globalSearchQuery = '';
-  bool _isExpanded = false;
+  Map<String, dynamic>? _destinationHospital;
 
   bool _loading = false;
   bool _initializing = true;
   String? _error;
   String? _statusMessage;
+  String? _gpsStatus;
 
-  // Simulation parameters
+  LatLng? _devicePosition;
+  LatLng? _previousPosition;
+  DateTime? _previousPositionAt;
+  double _deviceSpeed = 0; // km/h — always what we report to backend
+  double _lastKnownSpeedKmh = 0;
+  double? _deviceHeading;
+  Timer? _gpsSyncTimer;
+  StreamSubscription<Position>? _positionSub;
+  bool _gpsBusy = false;
+  bool _followDevice = true;
+  DateTime? _lastRouteRefresh;
+
   List<LatLng> _routePoints = [];
-  List<LatLng> _previewRoutePoints = [];
-  double _progress = 0.0;
-  Timer? _simulationTimer;
-  bool _simBusy = false;
-  bool _showingOverview = false;
-
-  final LatLng _lahoreCenter = const LatLng(31.5204, 74.3587);
+  double? _routeDistanceMeters;
+  double? _etaMinutes;
 
   @override
   void initState() {
     super.initState();
+    _mapController = MapController();
     _initializeData();
   }
 
   @override
   void dispose() {
-    _simulationTimer?.cancel();
-    _pageController.dispose();
-    _searchController.dispose();
+    _gpsSyncTimer?.cancel();
+    _positionSub?.cancel();
+    _mapController.dispose();
     super.dispose();
   }
 
-  Future<void> _fetchPreviewRoute() async {
-    if (_selectedHospitalId == null || _myAmbulance == null) return;
-    final hospital = _hospitals.firstWhere(
-      (h) => h['id'] == _selectedHospitalId,
-      orElse: () => null,
-    );
-    if (hospital == null) return;
-    final startLat = double.tryParse(_myAmbulance?['currentLat']?.toString() ?? '') ?? _lahoreCenter.latitude;
-    final startLng = double.tryParse(_myAmbulance?['currentLng']?.toString() ?? '') ?? _lahoreCenter.longitude;
-    final destLat = double.tryParse(hospital['latitude']?.toString() ?? '') ?? _lahoreCenter.latitude;
-    final destLng = double.tryParse(hospital['longitude']?.toString() ?? '') ?? _lahoreCenter.longitude;
-    final pts = await _fetchLiveRoute(LatLng(startLat, startLng), LatLng(destLat, destLng));
-    if (mounted) {
-      setState(() {
-        _previewRoutePoints = pts;
-      });
+  void _safeMoveMap(LatLng target, double zoom) {
+    if (!_mapReady || !mounted) return;
+    try {
+      _mapController.move(target, zoom);
+    } catch (_) {
+      // Ignore after hot reload until map re-attaches
+      _mapReady = false;
+    }
+  }
+
+  double _currentZoomOr(double fallback) {
+    if (!_mapReady) return fallback;
+    try {
+      return _mapController.camera.zoom;
+    } catch (_) {
+      _mapReady = false;
+      return fallback;
     }
   }
 
@@ -89,238 +96,764 @@ class _HomePageState extends State<HomePage> {
     });
 
     try {
-      final cityId = _api.user?['cityId'] ?? 'LHE';
-      final h = await _api.fetchHospitals(cityId);
-      final et = await _api.fetchEmergencyTypes();
-      final tc = await _api.fetchTriageCodes();
-      final ambulances = await _api.fetchAmbulances(cityId);
-      final transits = await _api.fetchActiveTransits(cityId);
+      final cityId = _api.user?['cityId']?.toString();
+      if (cityId == null || cityId.isEmpty) {
+        throw Exception('No cityId on user. Please log in again.');
+      }
 
-      _hospitals = h;
-      _emergencyTypes = et;
-      _triageCodes = tc;
+      final results = await Future.wait([
+        _api.fetchHospitals(cityId),
+        _api.fetchEmergencyTypes(),
+        _api.fetchTriageCodes(),
+        _api.fetchMyAmbulance(),
+      ]);
 
-      _myAmbulance = ambulances.firstWhere(
-        (a) => a['driverId'] == _api.user?['id'],
-        orElse: () => ambulances.firstWhere(
-          (a) => a['status'] == 'available',
-          orElse: () => ambulances.isNotEmpty ? ambulances.first : null,
-        ),
-      );
+      _hospitals = results[0] as List<dynamic>;
+      _emergencyTypes = results[1] as List<dynamic>;
+      _triageCodes = results[2] as List<dynamic>;
+
+      final mine = results[3] as Map<String, dynamic>;
+      final ambulance = mine['ambulance'];
+      if (ambulance is Map) {
+        _myAmbulance = Map<String, dynamic>.from(ambulance);
+      } else if (mine['id'] != null) {
+        _myAmbulance = mine;
+      } else {
+        _myAmbulance = null;
+      }
+
+      _ambulanceId = _myAmbulance?['id']?.toString();
+      if (_ambulanceId == null || _ambulanceId!.isEmpty) {
+        _myAmbulance = null;
+        _error =
+            'No ambulance assigned. Admin must set this user as the ambulance Driver.';
+      }
+
+      final active = mine['activeTransit'];
+      if (active is Map) {
+        _activeTransit = Map<String, dynamic>.from(active);
+      } else {
+        _activeTransit = null;
+        try {
+          final transits = await _api.fetchActiveTransits(cityId);
+          if (_myAmbulance != null) {
+            _activeTransit = transits.cast<dynamic>().firstWhere(
+              (t) =>
+                  t['ambulanceId'] == _myAmbulance!['id'] &&
+                  (t['status'] == 'en_route' ||
+                      t['status'] == 'pending' ||
+                      t['status'] == 'arrived'),
+              orElse: () => null,
+            );
+          }
+        } catch (_) {}
+      }
 
       if (_myAmbulance != null) {
-        _activeTransit = transits.firstWhere(
-          (t) =>
-              t['ambulanceId'] == _myAmbulance?['id'] &&
-              (t['status'] == 'en_route' ||
-                  t['status'] == 'pending' ||
-                  t['status'] == 'arrived'),
-          orElse: () => null,
-        );
-
-        if (_activeTransit != null) {
-          await _loadActiveRoute();
+        final lastLat = double.tryParse(_myAmbulance!['currentLat']?.toString() ?? '');
+        final lastLng = double.tryParse(_myAmbulance!['currentLng']?.toString() ?? '');
+        if (lastLat != null && lastLng != null && _devicePosition == null) {
+          _devicePosition = LatLng(lastLat, lastLng);
         }
       }
+
+      if (_activeTransit != null) {
+        _resolveDestinationHospital();
+        await _refreshRouteToHospital(fitOverview: true);
+      }
+
+      await _startLiveGpsTracking();
     } catch (e) {
       _error = e.toString().replaceAll('Exception: ', '');
     } finally {
-      setState(() {
-        _initializing = false;
-      });
+      if (mounted) {
+        setState(() => _initializing = false);
+      }
     }
   }
 
-  Future<List<LatLng>> _fetchLiveRoute(LatLng from, LatLng to) async {
+  void _resolveDestinationHospital() {
+    final hospitalId = _activeTransit?['hospitalId'] ??
+        _activeTransit?['hospital']?['id'];
+    if (hospitalId == null) {
+      if (_activeTransit?['hospital'] is Map) {
+        _destinationHospital =
+            Map<String, dynamic>.from(_activeTransit!['hospital'] as Map);
+      }
+      return;
+    }
+    final match = _hospitals.cast<dynamic>().firstWhere(
+      (h) => h['id'] == hospitalId,
+      orElse: () => _activeTransit?['hospital'],
+    );
+    if (match is Map) {
+      _destinationHospital = Map<String, dynamic>.from(match);
+    }
+  }
+
+  Future<bool> _ensureLocationPermission() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      setState(() {
+        _error = 'Location services are disabled. Enable GPS to share live position.';
+      });
+      return false;
+    }
+
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      setState(() {
+        _error = 'Location permission is required for live GPS tracking.';
+      });
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _startLiveGpsTracking() async {
+    final ok = await _ensureLocationPermission();
+    if (!ok) return;
+
+    // Immediate GPS ping after login / home load (Admin Lat/Lng only update via this API)
     try {
-      final url = 'https://router.project-osrm.org/route/v1/driving/${from.longitude},${from.latitude};${to.longitude},${to.latitude}?overview=full&geometries=geojson';
-      final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 4));
-      if (res.statusCode == 200) {
-        final data = json.decode(res.body);
-        if (data['code'] == 'Ok' && data['routes'] != null && data['routes'].isNotEmpty) {
-          final coords = data['routes'][0]['geometry']['coordinates'] as List<dynamic>;
-          return coords.map<LatLng>((c) => LatLng(c[1] as double, c[0] as double)).toList();
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      );
+      _applyDevicePosition(pos);
+      await _syncGpsToServer(force: true);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _gpsStatus = 'Waiting for GPS fix…';
+        });
+      }
+    }
+
+    await _positionSub?.cancel();
+    _positionSub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 5,
+      ),
+    ).listen((pos) {
+      _applyDevicePosition(pos);
+    });
+
+    _gpsSyncTimer?.cancel();
+    _gpsSyncTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
+      // If we still have no fix, try once more before syncing
+      if (_devicePosition == null) {
+        try {
+          final pos = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+          );
+          _applyDevicePosition(pos);
+        } catch (_) {}
+      }
+      await _syncGpsToServer(force: true);
+      if (_activeTransit != null && _destinationHospital != null) {
+        await _refreshRouteToHospital();
+      }
+    });
+  }
+
+  void _applyDevicePosition(Position pos) {
+    if (!mounted) return;
+
+    final next = LatLng(pos.latitude, pos.longitude);
+    final now = DateTime.now();
+
+    // Geolocator speed is m/s → convert to km/h for Safe City / HQ
+    double? gpsSpeedKmh;
+    if (!pos.speed.isNaN && pos.speed >= 0) {
+      gpsSpeedKmh = pos.speed * 3.6;
+    }
+
+    double? derivedSpeedKmh;
+    if (_previousPosition != null && _previousPositionAt != null) {
+      final elapsedSec =
+          now.difference(_previousPositionAt!).inMilliseconds / 1000.0;
+      if (elapsedSec >= 0.8) {
+        final meters = Geolocator.distanceBetween(
+          _previousPosition!.latitude,
+          _previousPosition!.longitude,
+          next.latitude,
+          next.longitude,
+        );
+        derivedSpeedKmh = (meters / elapsedSec) * 3.6;
+      }
+    }
+
+    final reported = _resolveSpeedKmh(
+      gpsSpeedKmh: gpsSpeedKmh,
+      derivedSpeedKmh: derivedSpeedKmh,
+    );
+
+    setState(() {
+      _previousPosition = _devicePosition ?? next;
+      _previousPositionAt = now;
+      _devicePosition = next;
+      _deviceSpeed = reported;
+      if (reported > 1) _lastKnownSpeedKmh = reported;
+      _deviceHeading = (pos.heading.isNaN || pos.heading < 0) ? _deviceHeading : pos.heading;
+    });
+
+    if (_followDevice) {
+      final zoom = _currentZoomOr(15.0);
+      _safeMoveMap(_devicePosition!, zoom < 12 ? 15.0 : zoom);
+    }
+  }
+
+  /// Always return km/h for backend. Prefer GPS speed; else derived; else last known.
+  double _resolveSpeedKmh({double? gpsSpeedKmh, double? derivedSpeedKmh}) {
+    // Trust GPS when it reports meaningful motion
+    if (gpsSpeedKmh != null && gpsSpeedKmh >= 1.5) {
+      return double.parse(gpsSpeedKmh.clamp(0, 200).toStringAsFixed(1));
+    }
+    // Fallback: distance / time between consecutive fixes
+    if (derivedSpeedKmh != null && derivedSpeedKmh >= 1.5) {
+      return double.parse(derivedSpeedKmh.clamp(0, 200).toStringAsFixed(1));
+    }
+    // Low GPS/derived reading — treat as stopped only if both agree we're nearly still
+    if ((gpsSpeedKmh ?? 0) < 1.0 && (derivedSpeedKmh == null || derivedSpeedKmh < 1.5)) {
+      return 0.0;
+    }
+    // Keep last known while GPS briefly drops to 0 (common on some phones)
+    if (_lastKnownSpeedKmh > 1.5) {
+      return double.parse(_lastKnownSpeedKmh.toStringAsFixed(1));
+    }
+    return 0.0;
+  }
+
+  /// Speed value always included in telemetry (km/h number).
+  double _speedForTelemetry() {
+    return double.parse(_deviceSpeed.clamp(0, 200).toStringAsFixed(1));
+  }
+
+  Future<void> _syncGpsToServer({bool force = false}) async {
+    if (_gpsBusy && !force) return;
+    if (_ambulanceId == null || _ambulanceId!.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _gpsStatus = 'GPS not sent — no ambulance from /ambulances/mine';
+        });
+      }
+      return;
+    }
+    if (_devicePosition == null) {
+      if (mounted) {
+        setState(() => _gpsStatus = 'GPS not sent — no device fix yet');
+      }
+      return;
+    }
+
+    _gpsBusy = true;
+    final lat = _devicePosition!.latitude.toDouble();
+    final lng = _devicePosition!.longitude.toDouble();
+    final speed = _speedForTelemetry(); // always km/h, never omitted
+    final heading = _deviceHeading?.toDouble();
+    final transitId = _activeTransit?['id']?.toString();
+
+    try {
+      // Always PATCH the id returned by /ambulances/mine for this driver.
+      final res = await _api.postGpsUpdate(
+        _ambulanceId!,
+        lat,
+        lng,
+        speed,
+        heading: heading,
+        transitId: transitId,
+        etaMinutes: (transitId != null && _etaMinutes != null) ? _etaMinutes : null,
+      );
+
+      if (!mounted) return;
+
+      if (res['ambulance'] is Map) {
+        final updated = Map<String, dynamic>.from(res['ambulance'] as Map);
+        setState(() {
+          _myAmbulance = {...?_myAmbulance, ...updated};
+          if (updated['id'] != null) {
+            _ambulanceId = updated['id'].toString();
+          }
+          _gpsStatus =
+              'Admin sync OK · ${_myAmbulance?['unitNumber'] ?? _ambulanceId} · ${speed.toStringAsFixed(0)} km/h · ${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}';
+          _error = null;
+        });
+      } else {
+        setState(() {
+          _gpsStatus = 'Admin sync OK · $_ambulanceId · ${speed.toStringAsFixed(0)} km/h';
+        });
+      }
+
+      final transit = res['transit'];
+      if (transit is Map) {
+        final status = transit['status']?.toString();
+        if (status == 'completed') {
+          setState(() {
+            _statusMessage = 'Corridor completed.';
+            _activeTransit = null;
+            _destinationHospital = null;
+            _routePoints = [];
+            _routeDistanceMeters = null;
+            _etaMinutes = null;
+          });
+        } else {
+          setState(() {
+            _activeTransit = Map<String, dynamic>.from(transit);
+          });
         }
       }
     } catch (e) {
-      print('OSRM routing failed: $e');
+      if (mounted) {
+        setState(() {
+          _gpsStatus = 'GPS sync failed: ${e.toString().replaceAll('Exception: ', '')}';
+        });
+      }
+    } finally {
+      _gpsBusy = false;
     }
-    // Fallback to local Bezier generator
-    return _buildDemoRoute(from, to);
   }
 
-  Future<void> _loadActiveRoute({bool showOverview = false}) async {
-    final startLat = double.tryParse(_activeTransit?['currentLat']?.toString() ?? '') ??
-        double.tryParse(_activeTransit?['originLat']?.toString() ?? '') ??
-        double.tryParse(_myAmbulance?['currentLat']?.toString() ?? '') ??
-        _lahoreCenter.latitude;
-    final startLng = double.tryParse(_activeTransit?['currentLng']?.toString() ?? '') ??
-        double.tryParse(_activeTransit?['originLng']?.toString() ?? '') ??
-        double.tryParse(_myAmbulance?['currentLng']?.toString() ?? '') ??
-        _lahoreCenter.longitude;
+  Future<({List<LatLng> points, double? distanceM, double? durationS})> _fetchShortestRoute(
+    LatLng from,
+    LatLng to,
+  ) async {
+    try {
+      final url =
+          'https://router.project-osrm.org/route/v1/driving/${from.longitude},${from.latitude};${to.longitude},${to.latitude}?overview=full&geometries=geojson';
+      final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        if (data['code'] == 'Ok' && data['routes'] != null && data['routes'].isNotEmpty) {
+          final route = data['routes'][0] as Map<String, dynamic>;
+          final coords = route['geometry']['coordinates'] as List<dynamic>;
+          final points = coords
+              .map<LatLng>((c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()))
+              .toList();
+          return (
+            points: points,
+            distanceM: (route['distance'] as num?)?.toDouble(),
+            durationS: (route['duration'] as num?)?.toDouble(),
+          );
+        }
+      }
+    } catch (_) {}
+    return (points: [from, to], distanceM: null, durationS: null);
+  }
 
-    final destLat = double.tryParse(_activeTransit?['hospital']?['latitude']?.toString() ?? '') ??
-        _lahoreCenter.latitude;
-    final destLng = double.tryParse(_activeTransit?['hospital']?['longitude']?.toString() ?? '') ??
-        _lahoreCenter.longitude;
+  LatLng? _hospitalLatLng(Map<String, dynamic>? hospital) {
+    if (hospital == null) return null;
+    final lat = double.tryParse(hospital['latitude']?.toString() ?? '');
+    final lng = double.tryParse(hospital['longitude']?.toString() ?? '');
+    if (lat == null || lng == null) return null;
+    return LatLng(lat, lng);
+  }
 
-    final from = LatLng(startLat, startLng);
-    final to = LatLng(destLat, destLng);
-    final pts = await _fetchLiveRoute(from, to);
+  String _formatEta(double? minutes) {
+    if (minutes == null || minutes.isNaN) return '—';
+    final m = minutes.round().clamp(0, 9999);
+    if (m < 60) return '$m min';
+    final h = m ~/ 60;
+    final rem = m % 60;
+    return '${h}h ${rem}m';
+  }
+
+  String _formatDistance(double? meters) {
+    if (meters == null || meters.isNaN) return '—';
+    if (meters < 1000) return '${meters.round()} m';
+    return '${(meters / 1000).toStringAsFixed(1)} km';
+  }
+
+  /// Prefer OSRM road ETA; optionally blend with live ambulance speed if moving.
+  double? _computeDisplayEtaMinutes({
+    required double? osrmDurationSeconds,
+    required double? distanceMeters,
+  }) {
+    double? osrmMin;
+    if (osrmDurationSeconds != null && osrmDurationSeconds > 0) {
+      osrmMin = osrmDurationSeconds / 60.0;
+    }
+
+    // If ambulance is moving meaningfully, also estimate from remaining distance / speed
+    double? speedMin;
+    if (distanceMeters != null && distanceMeters > 0 && _deviceSpeed >= 8) {
+      speedMin = (distanceMeters / 1000.0) / _deviceSpeed * 60.0;
+    }
+
+    if (osrmMin != null && speedMin != null) {
+      // Weight toward live speed when corridor is active and vehicle is moving
+      return (osrmMin * 0.4) + (speedMin * 0.6);
+    }
+    return osrmMin ?? speedMin;
+  }
+
+  Future<void> _refreshRouteToHospital({bool fitOverview = false}) async {
+    final dest = _hospitalLatLng(_destinationHospital);
+    final from = _devicePosition ??
+        (_myAmbulance != null
+            ? LatLng(
+                double.tryParse(_myAmbulance!['currentLat']?.toString() ?? '') ??
+                    _lahoreCenter.latitude,
+                double.tryParse(_myAmbulance!['currentLng']?.toString() ?? '') ??
+                    _lahoreCenter.longitude,
+              )
+            : null);
+    if (from == null || dest == null) return;
+
+    final now = DateTime.now();
+    if (!fitOverview &&
+        _lastRouteRefresh != null &&
+        now.difference(_lastRouteRefresh!) < const Duration(seconds: 12)) {
+      return;
+    }
+    _lastRouteRefresh = now;
+
+    final result = await _fetchShortestRoute(from, dest);
+    if (!mounted) return;
+
+    final backendEta = double.tryParse(_activeTransit?['etaMinutes']?.toString() ?? '');
+    final displayEta = _computeDisplayEtaMinutes(
+          osrmDurationSeconds: result.durationS,
+          distanceMeters: result.distanceM,
+        ) ??
+        backendEta;
+
     setState(() {
-      _routePoints = pts;
-      _progress = 0.0;
+      _routePoints = result.points;
+      _routeDistanceMeters = result.distanceM;
+      _etaMinutes = displayEta;
     });
 
-    if (showOverview) {
-      setState(() {
-        _showingOverview = true;
-      });
-      _animateToOverview(from, to);
-    } else if (_activeTransit?['status'] == 'en_route') {
-      _startGpsSimulation();
+    if (fitOverview && result.points.isNotEmpty) {
+      _followDevice = false;
+      _fitRoute(from, dest);
+    }
+
+    // Push the same ETA the driver sees to HQ / Hospital / Safe City
+    if (displayEta != null) {
+      await _pushEtaToBackend(displayEta);
     }
   }
 
-  void _animateToOverview(LatLng from, LatLng to) {
+  Future<void> _pushEtaToBackend(double etaMinutes) async {
+    final transitId = _activeTransit?['id']?.toString();
+    if (transitId == null || transitId.isEmpty) return;
+
+    final status = _activeTransit?['status']?.toString();
+    if (status != null &&
+        status != 'pending' &&
+        status != 'en_route' &&
+        status != 'arrived') {
+      return;
+    }
+
+    try {
+      final speed = _speedForTelemetry();
+      final updated = await _api.updateTransitEta(
+        transitId: transitId,
+        etaMinutes: double.parse(etaMinutes.toStringAsFixed(1)),
+        currentLat: _devicePosition?.latitude,
+        currentLng: _devicePosition?.longitude,
+        currentSpeed: speed, // always km/h so Safe City card is not stuck at 0
+      );
+      if (!mounted) return;
+      setState(() {
+        _activeTransit = {...?_activeTransit, ...updated};
+        final serverEta = double.tryParse(updated['etaMinutes']?.toString() ?? '');
+        if (serverEta != null) _etaMinutes = serverEta;
+      });
+    } catch (_) {
+      // Don't block navigation if ETA sync fails; GPS loop will retry
+    }
+  }
+
+  void _fitRoute(LatLng from, LatLng to) {
     final midLat = (from.latitude + to.latitude) / 2;
     final midLng = (from.longitude + to.longitude) / 2;
     final latDiff = (from.latitude - to.latitude).abs();
     final lngDiff = (from.longitude - to.longitude).abs();
     final maxDiff = latDiff > lngDiff ? latDiff : lngDiff;
     double zoom = 13.0;
-    if (maxDiff > 0.15) zoom = 11.0;
-    else if (maxDiff > 0.07) zoom = 12.0;
-    else if (maxDiff < 0.01) zoom = 14.5;
-    _mapController.move(LatLng(midLat, midLng), zoom);
-  }
-
-  void _beginNavigation() {
-    setState(() {
-      _showingOverview = false;
-    });
-    // Zoom back in to ambulance position
-    if (_routePoints.isNotEmpty) {
-      _mapController.move(_routePoints.first, 15.5);
+    if (maxDiff > 0.15) {
+      zoom = 11.0;
+    } else if (maxDiff > 0.07) {
+      zoom = 12.0;
+    } else if (maxDiff < 0.01) {
+      zoom = 14.5;
     }
-    _startGpsSimulation();
+    _safeMoveMap(LatLng(midLat, midLng), zoom);
   }
 
-  List<LatLng> _buildDemoRoute(LatLng from, LatLng to, {int steps = 24}) {
-    final List<LatLng> points = [];
-    final double midLat = (from.latitude + to.latitude) / 2 + (to.longitude - from.longitude) * 0.15;
-    final double midLng = (from.longitude + to.longitude) / 2 - (to.latitude - from.latitude) * 0.15;
-
-    for (int i = 0; i <= steps; i++) {
-      final double t = i / steps;
-      final double lat = (1 - t) * (1 - t) * from.latitude + 2 * (1 - t) * t * midLat + t * t * to.latitude;
-      final double lng = (1 - t) * (1 - t) * from.longitude + 2 * (1 - t) * t * midLng + t * t * to.longitude;
-      points.add(LatLng(lat, lng));
-    }
-    return points;
-  }
-
-  LatLng _interpolateRouteProgress(List<LatLng> route, double progress) {
-    if (route.isEmpty) return const LatLng(0, 0);
-    if (progress <= 0) return route.first;
-    if (progress >= 1) return route.last;
-    final double idx = progress * (route.length - 1);
-    final int i = idx.floor();
-    final double f = idx - i;
-    final LatLng a = route[i];
-    final LatLng b = route[(i + 1).clamp(0, route.length - 1)];
-    return LatLng(a.latitude + (b.latitude - a.latitude) * f, a.longitude + (b.longitude - a.longitude) * f);
-  }
-
-  void _startGpsSimulation() {
-    _simulationTimer?.cancel();
-    _simulationTimer = Timer.periodic(const Duration(milliseconds: 2500), (timer) async {
-      if (_simBusy || _activeTransit == null || _myAmbulance == null || _routePoints.length < 2) return;
-
-      _simBusy = true;
-      final nextProgress = (_progress + 0.04).clamp(0.0, 1.0);
-      final nextCoords = _interpolateRouteProgress(_routePoints, nextProgress);
-
-      try {
-        final res = await _api.postGpsUpdate(
-          _myAmbulance!['id'],
-          nextCoords.latitude,
-          nextCoords.longitude,
-          38.0,
-        );
-
-        if (res['transit']?['status'] == 'completed') {
-          timer.cancel();
-          setState(() {
-            _statusMessage = 'Destination hospital entered (geofence). Corridor completed.';
-            _activeTransit = null;
-            _routePoints = [];
-            _progress = 0.0;
-          });
-          _initializeData();
-        } else {
-          setState(() {
-            _progress = nextProgress;
-            if (res['transit'] != null) {
-              _activeTransit = res['transit'];
-            }
-          });
-        }
-      } catch (_) {
-        // Continue simulation on network blips
-      } finally {
-        _simBusy = false;
-      }
-    });
-  }
-
-  Future<void> _handleStartTransit() async {
-    if (_myAmbulance == null ||
-        _selectedHospitalId == null ||
-        _selectedEmergencyTypeId == null ||
-        _selectedTriageCodeId == null) {
+  Future<void> _openRequestForm() async {
+    if (_ambulanceId == null || _myAmbulance == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please complete all selection fields first.')),
+        const SnackBar(
+          content: Text('No ambulance assigned. Ask Admin to set your driverId.'),
+        ),
+      );
+      return;
+    }
+    if (_activeTransit != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Finish the active corridor before starting another.')),
       );
       return;
     }
 
+    String? hospitalId;
+    String? triageId;
+    String? emergencyId;
+    final notesController = TextEditingController();
+    var submitting = false;
+    String? formError;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
+            return Padding(
+              padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + bottomInset),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade300,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Request Green Corridor',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: _green,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Select destination hospital, triage, and emergency type.',
+                      style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+                    ),
+                    const SizedBox(height: 20),
+                    DropdownButtonFormField<String>(
+                      value: hospitalId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Hospital',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.local_hospital, color: _green),
+                      ),
+                      items: _hospitals.map<DropdownMenuItem<String>>((h) {
+                        return DropdownMenuItem<String>(
+                          value: h['id']?.toString(),
+                          child: Text(
+                            h['name']?.toString() ?? 'Hospital',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: submitting
+                          ? null
+                          : (v) => setSheetState(() => hospitalId = v),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      value: triageId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Triage code',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.flag, color: _green),
+                      ),
+                      items: _triageCodes.map<DropdownMenuItem<String>>((t) {
+                        return DropdownMenuItem<String>(
+                          value: t['id']?.toString(),
+                          child: Text(t['name']?.toString() ?? 'Triage'),
+                        );
+                      }).toList(),
+                      onChanged: submitting
+                          ? null
+                          : (v) => setSheetState(() => triageId = v),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      value: emergencyId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Emergency type',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.medical_services, color: _green),
+                      ),
+                      items: _emergencyTypes.map<DropdownMenuItem<String>>((e) {
+                        return DropdownMenuItem<String>(
+                          value: e['id']?.toString(),
+                          child: Text(
+                            e['name']?.toString() ?? 'Emergency',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: submitting
+                          ? null
+                          : (v) => setSheetState(() => emergencyId = v),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: notesController,
+                      enabled: !submitting,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                        labelText: 'Notes (optional)',
+                        border: OutlineInputBorder(),
+                        alignLabelWithHint: true,
+                        prefixIcon: Icon(Icons.notes, color: _green),
+                      ),
+                    ),
+                    if (formError != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        formError!,
+                        style: const TextStyle(
+                          color: Colors.red,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 20),
+                    ElevatedButton(
+                      onPressed: submitting
+                          ? null
+                          : () async {
+                              if (hospitalId == null ||
+                                  triageId == null ||
+                                  emergencyId == null) {
+                                setSheetState(() {
+                                  formError = 'Please select hospital, triage, and emergency type.';
+                                });
+                                return;
+                              }
+
+                              setSheetState(() {
+                                submitting = true;
+                                formError = null;
+                              });
+
+                              try {
+                                await _submitCorridorRequest(
+                                  hospitalId: hospitalId!,
+                                  triageId: triageId!,
+                                  emergencyId: emergencyId!,
+                                  notes: notesController.text.trim(),
+                                );
+                                if (ctx.mounted) Navigator.of(ctx).pop();
+                              } catch (e) {
+                                setSheetState(() {
+                                  submitting = false;
+                                  formError =
+                                      e.toString().replaceAll('Exception: ', '');
+                                });
+                              }
+                            },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _green,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      child: submitting
+                          ? const SizedBox(
+                              height: 22,
+                              width: 22,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.5,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Text(
+                              'Send Request',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    notesController.dispose();
+  }
+
+  Future<void> _submitCorridorRequest({
+    required String hospitalId,
+    required String triageId,
+    required String emergencyId,
+    required String notes,
+  }) async {
+    final hospital = _hospitals.cast<dynamic>().firstWhere((h) => h['id'] == hospitalId);
+    final origin = _devicePosition ??
+        LatLng(
+          double.tryParse(_myAmbulance?['currentLat']?.toString() ?? '') ??
+              _lahoreCenter.latitude,
+          double.tryParse(_myAmbulance?['currentLng']?.toString() ?? '') ??
+              _lahoreCenter.longitude,
+        );
+
+    final transit = await _api.createTransit(
+      ambulanceId: _ambulanceId!,
+      hospitalId: hospitalId,
+      emergencyTypeId: emergencyId,
+      triageCodeId: triageId,
+      sectorId: hospital['sectorId']?.toString(),
+      paramedicNotes: notes.isEmpty ? null : notes,
+      originLat: origin.latitude,
+      originLng: origin.longitude,
+      baselineEtaMinutes: 12,
+    );
+
+    final started = await _api.startTransit(
+      transit['id'],
+      origin.latitude,
+      origin.longitude,
+    );
+
     setState(() {
-      _loading = true;
-      _statusMessage = null;
+      _activeTransit = started;
+      _destinationHospital = Map<String, dynamic>.from(hospital as Map);
+      _statusMessage = 'Green Corridor LIVE — shortest path drawn.';
+      _error = null;
     });
 
-    try {
-      final selectedHospital = _hospitals.firstWhere((h) => h['id'] == _selectedHospitalId);
-      final startLat = double.tryParse(_myAmbulance?['currentLat']?.toString() ?? '') ?? _lahoreCenter.latitude + 0.01;
-      final startLng = double.tryParse(_myAmbulance?['currentLng']?.toString() ?? '') ?? _lahoreCenter.longitude - 0.01;
-
-      final transit = await _api.createTransit(
-        ambulanceId: _myAmbulance!['id'],
-        hospitalId: _selectedHospitalId!,
-        emergencyTypeId: _selectedEmergencyTypeId!,
-        triageCodeId: _selectedTriageCodeId!,
-        sectorId: selectedHospital['sectorId'],
-        paramedicNotes: null,
-        originLat: startLat,
-        originLng: startLng,
-      );
-
-      final started = await _api.startTransit(transit['id'], startLat, startLng);
-
-      setState(() {
-        _activeTransit = started;
-        _previewRoutePoints = [];
-        _statusMessage = 'Green Corridor LIVE — GPS updates started.';
-      });
-      await _loadActiveRoute(showOverview: true);
-    } catch (e) {
-      _error = e.toString().replaceAll('Exception: ', '');
-    } finally {
-      setState(() {
-        _loading = false;
-      });
-    }
+    // Compute OSRM ETA → PATCH /transits/{id}/eta immediately, then GPS ping
+    await _refreshRouteToHospital(fitOverview: true);
+    await _syncGpsToServer(force: true);
   }
 
   Future<void> _handleArrived() async {
@@ -330,10 +863,10 @@ class _HomePageState extends State<HomePage> {
       final res = await _api.markArrived(_activeTransit!['id']);
       setState(() {
         _activeTransit = res;
-        _statusMessage = 'Arrived status reported to hospital ER.';
+        _statusMessage = 'Arrived reported to hospital.';
       });
     } catch (e) {
-      _error = e.toString().replaceAll('Exception: ', '');
+      setState(() => _error = e.toString().replaceAll('Exception: ', ''));
     } finally {
       setState(() => _loading = false);
     }
@@ -344,36 +877,26 @@ class _HomePageState extends State<HomePage> {
     setState(() => _loading = true);
     try {
       await _api.completeTransit(_activeTransit!['id']);
-      _simulationTimer?.cancel();
       setState(() {
         _activeTransit = null;
+        _destinationHospital = null;
         _routePoints = [];
-        _previewRoutePoints = [];
-        _showingOverview = false;
-        _progress = 0.0;
-        _selectedHospitalId = null;
-        _selectedEmergencyTypeId = null;
-        _selectedTriageCodeId = null;
-        _currentStep = 0;
-        _globalSearchQuery = '';
-        _isExpanded = false;
-        _statusMessage = 'Green Corridor complete. Ambulance available.';
+        _routeDistanceMeters = null;
+        _etaMinutes = null;
+        _followDevice = true;
+        _statusMessage = 'Trip complete. Ambulance available.';
       });
-      _searchController.clear();
-      if (_pageController.hasClients) {
-        _pageController.jumpToPage(0);
-      }
-      _initializeData();
+      await _syncGpsToServer(force: true);
     } catch (e) {
-      _error = e.toString().replaceAll('Exception: ', '');
+      setState(() => _error = e.toString().replaceAll('Exception: ', ''));
     } finally {
       setState(() => _loading = false);
     }
   }
 
-
-
-  void _handleLogout() async {
+  Future<void> _handleLogout() async {
+    _gpsSyncTimer?.cancel();
+    await _positionSub?.cancel();
     await _api.logout();
     if (mounted) {
       Navigator.of(context).pushReplacement(
@@ -386,1078 +909,376 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     if (_initializing) {
       return const Scaffold(
-        body: Center(child: CircularProgressIndicator(color: const Color(0xFF16A34A))),
+        body: Center(child: CircularProgressIndicator(color: _green)),
       );
     }
 
+    final mapCenter = _devicePosition ??
+        (_myAmbulance != null
+            ? LatLng(
+                double.tryParse(_myAmbulance!['currentLat']?.toString() ?? '') ??
+                    _lahoreCenter.latitude,
+                double.tryParse(_myAmbulance!['currentLng']?.toString() ?? '') ??
+                    _lahoreCenter.longitude,
+              )
+            : _lahoreCenter);
 
-    final theme = Theme.of(context);
-    final size = MediaQuery.of(context).size;
-    final isTablet = size.width > 720;
+    final hospitalPoint = _hospitalLatLng(_destinationHospital);
+    final markers = <Marker>[
+      Marker(
+        point: mapCenter,
+        width: 52,
+        height: 52,
+        child: Container(
+          decoration: BoxDecoration(
+            color: _green,
+            shape: BoxShape.circle,
+            boxShadow: const [
+              BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 3)),
+            ],
+          ),
+          child: const Icon(Icons.local_shipping, color: Colors.white, size: 26),
+        ),
+      ),
+    ];
 
-    LatLng mapCenter = _lahoreCenter;
-    if (_routePoints.isNotEmpty) {
-      mapCenter = _interpolateRouteProgress(_routePoints, _progress);
-    } else if (_myAmbulance != null) {
-      final lat = double.tryParse(_myAmbulance?['currentLat']?.toString() ?? '') ?? _lahoreCenter.latitude;
-      final lng = double.tryParse(_myAmbulance?['currentLng']?.toString() ?? '') ?? _lahoreCenter.longitude;
-      mapCenter = LatLng(lat, lng);
-    }
-
-    // Build map marker objects
-    final List<Marker> markers = [];
-    if (_myAmbulance != null) {
+    if (hospitalPoint != null) {
       markers.add(
         Marker(
-          point: mapCenter,
-          width: 52,
-          height: 52,
+          point: hospitalPoint,
+          width: 56,
+          height: 56,
           child: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFF16A34A),
+              color: Colors.white,
               shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 3))
+              border: Border.all(color: _green, width: 3),
+              boxShadow: const [
+                BoxShadow(color: Colors.black38, blurRadius: 8, offset: Offset(0, 3)),
               ],
             ),
-            child: const Icon(Icons.local_shipping, color: Colors.white, size: 26),
+            child: const Icon(Icons.local_hospital, color: _green, size: 28),
           ),
         ),
       );
     }
-
-    if (_activeTransit != null) {
-      final destLat = double.tryParse(_activeTransit?['hospital']?['latitude']?.toString() ?? '') ?? _lahoreCenter.latitude;
-      final destLng = double.tryParse(_activeTransit?['hospital']?['longitude']?.toString() ?? '') ?? _lahoreCenter.longitude;
-      markers.add(
-        Marker(
-          point: LatLng(destLat, destLng),
-          width: 72,
-          height: 84,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFF16A34A), width: 3),
-                  boxShadow: const [
-                    BoxShadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4))
-                  ],
-                ),
-                child: const Icon(Icons.local_hospital, color: const Color(0xFF16A34A), size: 32),
-              ),
-              const SizedBox(height: 2),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF16A34A),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  _activeTransit?['hospital']?['name']?.toString().split(' ').take(2).join(' ') ?? 'Hospital',
-                  style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    Widget controlPanel = Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onVerticalDragUpdate: (details) {
-              if (details.primaryDelta! < -5) {
-                setState(() {
-                  _isExpanded = true;
-                });
-              } else if (details.primaryDelta! > 5) {
-                setState(() {
-                  _isExpanded = false;
-                });
-              }
-            },
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade300,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _myAmbulance?['unitNumber'] ?? 'Ambulance Unit',
-                          style: theme.textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.bold,
-                            color: const Color(0xFF16A34A),
-                          ),
-                        ),
-                        Text(
-                          _api.user?['name'] ?? '',
-                          style: theme.textTheme.bodySmall?.copyWith(color: Colors.grey.shade600),
-                        ),
-                      ],
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.logout, color: const Color(0xFF16A34A)),
-                      onPressed: _handleLogout,
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-            const SizedBox(height: 4),
-            if (_statusMessage != null) ...[
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade100,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: Colors.grey.shade300),
-                ),
-                child: Text(
-                  _statusMessage!,
-                  style: const TextStyle(
-                    color: const Color(0xFF16A34A),
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 4),
-            ],
-            if (_activeTransit == null) ...[
-              Row(
-                children: [
-                  if (_currentStep > 0)
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back, color: const Color(0xFF16A34A), size: 18),
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                      onPressed: () {
-                        _pageController.previousPage(
-                          duration: const Duration(milliseconds: 300),
-                          curve: Curves.easeInOut,
-                        );
-                      },
-                    ),
-                  if (_currentStep > 0) const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      'Step ${_currentStep + 1} of 4: ' +
-                          (_currentStep == 0
-                              ? 'Triage Code'
-                              : _currentStep == 1
-                                  ? 'Medical Issue'
-                                  : _currentStep == 2
-                                      ? 'Destination Hospital'
-                                      : 'Confirm & Depart'),
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                        color: const Color(0xFF16A34A),
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      _isExpanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up,
-                      color: const Color(0xFF16A34A),
-                      size: 20,
-                    ),
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                    onPressed: () {
-                      setState(() {
-                        _isExpanded = !_isExpanded;
-                      });
-                    },
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              LinearProgressIndicator(
-                value: (_currentStep + 1) / 4.0,
-                backgroundColor: Colors.grey.shade200,
-                color: const Color(0xFF16A34A),
-              ),
-              const SizedBox(height: 8),
-              if (_currentStep < 3) ...[
-                SizedBox(
-                  height: 36,
-                  child: TextField(
-                    controller: _searchController,
-                    style: const TextStyle(fontSize: 12, color: const Color(0xFF16A34A)),
-                    decoration: InputDecoration(
-                      hintText: 'Search...',
-                      hintStyle: TextStyle(color: Colors.grey.shade500),
-                      prefixIcon: const Icon(Icons.search, size: 16, color: const Color(0xFF16A34A)),
-                      isDense: true,
-                      fillColor: Colors.grey.shade100,
-                      filled: true,
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      border: const OutlineInputBorder(
-                        borderRadius: BorderRadius.all(Radius.circular(8)),
-                        borderSide: BorderSide.none,
-                      ),
-                      suffixIcon: _globalSearchQuery.isNotEmpty
-                          ? IconButton(
-                              icon: const Icon(Icons.clear, size: 14, color: const Color(0xFF16A34A)),
-                              onPressed: () {
-                                setState(() {
-                                  _globalSearchQuery = '';
-                                  _searchController.clear();
-                                });
-                              },
-                            )
-                          : null,
-                    ),
-                    onChanged: (val) {
-                      setState(() {
-                        _globalSearchQuery = val;
-                      });
-                    },
-                  ),
-                ),
-                const SizedBox(height: 6),
-              ],
-              Expanded(
-                child: PageView(
-                  controller: _pageController,
-                  physics: const NeverScrollableScrollPhysics(),
-                  onPageChanged: (val) {
-                    setState(() {
-                      _currentStep = val;
-                    });
-                  },
-                  children: [
-                    _buildTriagePage(),
-                    _buildIssuePage(),
-                    _buildHospitalPage(),
-                    _buildConfirmPage(theme),
-                  ],
-                ),
-              ),
-            ] else ...[
-              Expanded(
-                child: SingleChildScrollView(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Colors.grey.shade50,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.grey.shade300),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Corridor Active: ${_activeTransit!['transitId']}',
-                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: const Color(0xFF16A34A)),
-                            ),
-                            const SizedBox(height: 6),
-                            Text('Issue: ${_activeTransit!['emergencyType']['name']}', style: const TextStyle(color: const Color(0xFF16A34A))),
-                            Text('Triage: ${_activeTransit!['triageCode']['name']}', style: const TextStyle(color: const Color(0xFF16A34A))),
-                            Text('Destination: ${_activeTransit!['hospital']['name']}', style: const TextStyle(color: const Color(0xFF16A34A))),
-                            const SizedBox(height: 6),
-                            Text(
-                              'Status: ${_activeTransit!['status'].toString().toUpperCase()}',
-                              style: const TextStyle(fontWeight: FontWeight.bold, color: const Color(0xFF16A34A)),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      if (_activeTransit!['status'] == 'en_route') ...[
-                        ElevatedButton.icon(
-                          onPressed: _loading ? null : _handleArrived,
-                          icon: const Icon(Icons.check_circle_outline),
-                          label: const Text('MARK ARRIVED AT HOSPITAL'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF16A34A),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                      ElevatedButton.icon(
-                        onPressed: _loading ? null : _handleComplete,
-                        icon: const Icon(Icons.done_all),
-                        label: const Text('COMPLETE TRIP'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF16A34A),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-            if (_error != null) ...[
-              const SizedBox(height: 4),
-              Text(
-                _error!,
-                style: const TextStyle(color: const Color(0xFF16A34A), fontWeight: FontWeight.bold, fontSize: 11),
-              ),
-            ]
-          ],
-        ),
-      );
-
-    Widget mapPanel = Stack(
-      children: [
-        FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCenter: mapCenter,
-            initialZoom: 14.0,
-          ),
-          children: [
-            TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'pk.gchq.paramedic_app',
-            ),
-            if (_previewRoutePoints.isNotEmpty && _activeTransit == null)
-              PolylineLayer(
-                polylines: [
-                  Polyline(
-                    points: _previewRoutePoints,
-                    strokeWidth: 4.0,
-                    color: Colors.grey.shade500,
-                    isDotted: true,
-                  ),
-                ],
-              ),
-            if (_routePoints.isNotEmpty)
-              PolylineLayer(
-                polylines: [
-                  Polyline(
-                    points: _routePoints,
-                    strokeWidth: 5.0,
-                    color: const Color(0xFF16A34A),
-                  ),
-                ],
-              ),
-            MarkerLayer(markers: markers),
-          ],
-        ),
-        // Live status pill on top of map
-        if (_activeTransit != null)
-          Positioned(
-            top: 16,
-            right: 16,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFF16A34A),
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 6)],
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.radar, color: Colors.white, size: 14),
-                  SizedBox(width: 6),
-                  Text(
-                    'GREEN CORRIDOR LIVE',
-                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11, letterSpacing: 0.5),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        // Route preview pill when hospital selected
-        if (_previewRoutePoints.isNotEmpty && _activeTransit == null)
-          Positioned(
-            top: 16,
-            right: 16,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: const Color(0xFF16A34A), width: 1.5),
-                boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 6)],
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.route, color: const Color(0xFF16A34A), size: 14),
-                  SizedBox(width: 6),
-                  Text(
-                    'ROUTE PREVIEW',
-                    style: TextStyle(color: const Color(0xFF16A34A), fontWeight: FontWeight.bold, fontSize: 11, letterSpacing: 0.5),
-                  ),
-                ],
-              ),
-            ),
-          ),
-      ],
-    );
 
     return Scaffold(
       body: Stack(
         children: [
-          mapPanel,
-          if (isTablet)
-            Positioned(
-              top: 24,
-              left: 24,
-              width: 380,
-              height: _isExpanded ? 400 : 250,
-              child: Card(
-                elevation: 6,
-                shadowColor: Colors.black38,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                child: controlPanel,
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: mapCenter,
+              initialZoom: 14.5,
+              onMapReady: () {
+                _mapReady = true;
+              },
+              onPositionChanged: (pos, hasGesture) {
+                if (hasGesture) _followDevice = false;
+              },
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'pk.gchq.paramedic_app',
               ),
-            )
-          else
-            Positioned(
-              bottom: 16,
-              left: 16,
-              right: 16,
-              height: _isExpanded ? 400 : 250,
-              child: Card(
-                elevation: 6,
-                shadowColor: Colors.black38,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                child: controlPanel,
+              if (_routePoints.length >= 2)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: _routePoints,
+                      strokeWidth: 5,
+                      color: _green,
+                    ),
+                  ],
+                ),
+              MarkerLayer(markers: markers),
+            ],
+          ),
+
+          // Top bar
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Material(
+                      elevation: 3,
+                      borderRadius: BorderRadius.circular(12),
+                      color: Colors.white,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              _myAmbulance?['unitNumber']?.toString() ?? 'No unit assigned',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: _green,
+                                fontSize: 15,
+                              ),
+                            ),
+                            Text(
+                              _api.user?['name']?.toString() ?? '',
+                              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                            ),
+                            if (_gpsStatus != null)
+                              Text(
+                                _gpsStatus!,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: _gpsStatus!.contains('failed') ||
+                                          _gpsStatus!.contains('not sent')
+                                      ? Colors.red.shade700
+                                      : Colors.grey.shade700,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Material(
+                    elevation: 3,
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                    child: IconButton(
+                      tooltip: 'Recenter',
+                      icon: const Icon(Icons.my_location, color: _green),
+                      onPressed: () {
+                        if (_devicePosition != null) {
+                          setState(() => _followDevice = true);
+                          _safeMoveMap(_devicePosition!, 15.5);
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Material(
+                    elevation: 3,
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(12),
+                    child: IconButton(
+                      tooltip: 'Logout',
+                      icon: const Icon(Icons.logout, color: _green),
+                      onPressed: _handleLogout,
+                    ),
+                  ),
+                ],
               ),
             ),
-          // Route overview overlay — shown after DEPART, before guidance starts
-          if (_showingOverview && _activeTransit != null)
+          ),
+
+          if (_activeTransit != null)
             Positioned(
-              bottom: 24,
-              left: 16,
-              right: 16,
-              child: SafeArea(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(20),
-                    boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 24, offset: Offset(0, 8))],
-                    border: Border.all(color: Colors.black12),
-                  ),
+              top: MediaQuery.of(context).padding.top + 72,
+              left: 12,
+              right: 12,
+              child: Material(
+                elevation: 4,
+                borderRadius: BorderRadius.circular(14),
+                color: Colors.white,
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
                   child: Column(
-                    mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       Row(
                         children: [
                           Container(
-                            width: 36,
-                            height: 36,
-                            decoration: const BoxDecoration(color: const Color(0xFF16A34A), shape: BoxShape.circle),
-                            child: const Icon(Icons.local_shipping, color: Colors.white, size: 18),
-                          ),
-                          Expanded(
-                            child: Container(
-                              margin: const EdgeInsets.symmetric(horizontal: 6),
-                              height: 2,
-                              color: const Color(0xFF16A34A),
-                            ),
-                          ),
-                          const Icon(Icons.navigation, color: const Color(0xFF16A34A), size: 16),
-                          Expanded(
-                            child: Container(
-                              margin: const EdgeInsets.symmetric(horizontal: 6),
-                              height: 2,
-                              color: const Color(0xFF16A34A),
-                            ),
-                          ),
-                          Container(
-                            width: 36,
-                            height: 36,
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                             decoration: BoxDecoration(
-                              color: Colors.grey.shade100,
-                              shape: BoxShape.circle,
-                              border: Border.all(color: const Color(0xFF16A34A), width: 2),
+                              color: _green,
+                              borderRadius: BorderRadius.circular(20),
                             ),
-                            child: const Icon(Icons.local_hospital, color: const Color(0xFF16A34A), size: 18),
+                            child: const Text(
+                              'LIVE',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 11,
+                              ),
+                            ),
                           ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
+                          const SizedBox(width: 8),
                           Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  _activeTransit?['hospital']?['name'] ?? 'Destination Hospital',
-                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: const Color(0xFF16A34A)),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  'Pan & zoom to explore • ${_routePoints.length} waypoints',
-                                  style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
-                                ),
-                              ],
+                            child: Text(
+                              _activeTransit?['transitId']?.toString() ??
+                                  _activeTransit?['id']?.toString() ??
+                                  'Corridor active',
+                              style: const TextStyle(fontWeight: FontWeight.bold),
                             ),
                           ),
-                          const SizedBox(width: 12),
-                          ElevatedButton.icon(
-                            onPressed: _beginNavigation,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF16A34A),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                              elevation: 0,
-                            ),
-                            icon: const Icon(Icons.navigation, size: 18),
-                            label: const Text(
-                              'GO',
-                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, letterSpacing: 0.5),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTriagePage() {
-    final filtered = _triageCodes.where((tc) {
-      final name = (tc['name'] ?? '').toString().toLowerCase();
-      return name.contains(_globalSearchQuery.toLowerCase());
-    }).toList();
-
-    if (filtered.isEmpty) {
-      return const Center(child: Text('No results found', style: TextStyle(fontSize: 12, color: Colors.grey)));
-    }
-
-    if (_isExpanded) {
-      return ListView.builder(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        itemCount: filtered.length,
-        itemBuilder: (context, index) {
-          final tc = filtered[index];
-          final name = tc['name'] ?? '';
-          final isSelected = _selectedTriageCodeId == tc['id'];
-          Color dotColor = Colors.grey;
-          if (name.toLowerCase().contains('red')) dotColor = Colors.red;
-          else if (name.toLowerCase().contains('amber')) dotColor = Colors.amber;
-          else if (name.toLowerCase().contains('green')) dotColor = Colors.green;
-
-          return Container(
-            margin: const EdgeInsets.only(bottom: 6),
-            child: ListTile(
-              dense: true,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-                side: BorderSide(color: isSelected ? const Color(0xFF16A34A) : Colors.grey.shade300, width: isSelected ? 2 : 1),
-              ),
-              tileColor: isSelected ? Colors.grey.shade100 : Colors.white,
-              leading: Container(
-                width: 10,
-                height: 10,
-                decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
-              ),
-              title: Text(name, style: TextStyle(fontWeight: isSelected ? FontWeight.bold : FontWeight.normal, color: const Color(0xFF16A34A))),
-              onTap: () {
-                setState(() {
-                  _selectedTriageCodeId = tc['id'];
-                });
-                Future.delayed(const Duration(milliseconds: 300), () {
-                  if (_pageController.hasClients) {
-                    _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
-                  }
-                });
-              },
-            ),
-          );
-        },
-      );
-    }
-
-    return Align(
-      alignment: Alignment.center,
-      child: SizedBox(
-        height: 56,
-        child: Row(
-          children: filtered.map<Widget>((tc) {
-            final name = tc['name'] ?? '';
-            final isSelected = _selectedTriageCodeId == tc['id'];
-            Color dotColor = Colors.grey;
-            if (name.toLowerCase().contains('red')) dotColor = Colors.red;
-            else if (name.toLowerCase().contains('amber')) dotColor = Colors.amber;
-            else if (name.toLowerCase().contains('green')) dotColor = Colors.green;
-
-            return Expanded(
-              child: Container(
-                margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
-                child: InkWell(
-                  onTap: () {
-                    setState(() {
-                      _selectedTriageCodeId = tc['id'];
-                    });
-                    Future.delayed(const Duration(milliseconds: 300), () {
-                      if (_pageController.hasClients) {
-                        _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
-                      }
-                    });
-                  },
-                  child: Container(
-                    height: 48,
-                    decoration: BoxDecoration(
-                      color: isSelected ? Colors.grey.shade100 : Colors.white,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: isSelected ? const Color(0xFF16A34A) : Colors.grey.shade300, width: isSelected ? 2 : 1),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
-                        ),
-                        const SizedBox(width: 6),
-                        Flexible(
-                          child: Text(
-                            name.replaceAll('Code ', ''),
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                              color: const Color(0xFF16A34A),
+                          Text(
+                            (_activeTransit?['status'] ?? '').toString().toUpperCase(),
+                            style: const TextStyle(
+                              color: _green,
+                              fontWeight: FontWeight.w700,
                               fontSize: 12,
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            );
-          }).toList(),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildIssuePage() {
-    final filtered = _emergencyTypes.where((et) {
-      final name = (et['name'] ?? '').toString().toLowerCase();
-      return name.contains(_globalSearchQuery.toLowerCase());
-    }).toList();
-
-    if (filtered.isEmpty) {
-      return const Center(child: Text('No results found', style: TextStyle(fontSize: 12, color: Colors.grey)));
-    }
-
-    if (_isExpanded) {
-      return ListView.builder(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        itemCount: filtered.length,
-        itemBuilder: (context, index) {
-          final et = filtered[index];
-          final name = et['name'] ?? '';
-          final isSelected = _selectedEmergencyTypeId == et['id'];
-
-          return Container(
-            margin: const EdgeInsets.only(bottom: 6),
-            child: ListTile(
-              dense: true,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-                side: BorderSide(color: isSelected ? const Color(0xFF16A34A) : Colors.grey.shade300, width: isSelected ? 2 : 1),
-              ),
-              tileColor: isSelected ? Colors.grey.shade100 : Colors.white,
-              leading: Icon(Icons.medical_services_outlined, color: isSelected ? const Color(0xFF16A34A) : Colors.grey.shade600, size: 16),
-              title: Text(name, style: TextStyle(fontWeight: isSelected ? FontWeight.bold : FontWeight.normal, color: const Color(0xFF16A34A))),
-              onTap: () {
-                setState(() {
-                  _selectedEmergencyTypeId = et['id'];
-                });
-                Future.delayed(const Duration(milliseconds: 300), () {
-                  if (_pageController.hasClients) {
-                    _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
-                  }
-                });
-              },
-            ),
-          );
-        },
-      );
-    }
-
-    return Align(
-      alignment: Alignment.center,
-      child: SizedBox(
-        height: 56,
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Row(
-            children: filtered.map<Widget>((et) {
-              final name = et['name'] ?? '';
-              final isSelected = _selectedEmergencyTypeId == et['id'];
-
-              return Container(
-                margin: const EdgeInsets.only(right: 6),
-                child: InkWell(
-                  onTap: () {
-                    setState(() {
-                      _selectedEmergencyTypeId = et['id'];
-                    });
-                    Future.delayed(const Duration(milliseconds: 300), () {
-                      if (_pageController.hasClients) {
-                        _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
-                      }
-                    });
-                  },
-                  child: Container(
-                    height: 48,
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    decoration: BoxDecoration(
-                      color: isSelected ? Colors.grey.shade100 : Colors.white,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: isSelected ? const Color(0xFF16A34A) : Colors.grey.shade300, width: isSelected ? 2 : 1),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(Icons.medical_services_outlined, size: 14, color: isSelected ? const Color(0xFF16A34A) : Colors.grey.shade600),
-                        const SizedBox(width: 6),
-                        Text(
-                          name,
-                          style: TextStyle(
-                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                            color: const Color(0xFF16A34A),
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildHospitalPage() {
-    final reqSpecialty = _selectedEmergencyTypeId != null
-        ? _emergencyTypes.firstWhere(
-            (et) => et['id'] == _selectedEmergencyTypeId,
-            orElse: () => {'requiredSpecialty': null},
-          )['requiredSpecialty']
-        : null;
-
-    final filteredHospitals = _hospitals.where((h) {
-      final name = (h['name'] ?? '').toString().toLowerCase();
-      return name.contains(_globalSearchQuery.toLowerCase());
-    }).toList();
-
-    if (filteredHospitals.isEmpty) {
-      return const Center(child: Text('No results found', style: TextStyle(fontSize: 12, color: Colors.grey)));
-    }
-
-    if (_isExpanded) {
-      return ListView.builder(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        itemCount: filteredHospitals.length,
-        itemBuilder: (context, index) {
-          final h = filteredHospitals[index];
-          final id = h['id'];
-          String name = h['name'] ?? '';
-          final List<dynamic>? specs = h['specialties'];
-          final hasRecommended = reqSpecialty != null && specs != null && specs.contains(reqSpecialty);
-          if (hasRecommended) {
-            name += ' (Recommended)';
-          }
-          final isSelected = _selectedHospitalId == id;
-
-          return Container(
-            margin: const EdgeInsets.only(bottom: 6),
-            child: ListTile(
-              dense: true,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-                side: BorderSide(
-                  color: isSelected ? const Color(0xFF16A34A) : (hasRecommended ? Colors.grey.shade700 : Colors.grey.shade300),
-                  width: isSelected ? 2 : 1,
-                ),
-              ),
-              tileColor: isSelected ? Colors.grey.shade100 : (hasRecommended ? Colors.grey.shade50 : Colors.white),
-              leading: Icon(
-                Icons.local_hospital_outlined,
-                color: isSelected ? const Color(0xFF16A34A) : (hasRecommended ? Colors.grey.shade700 : Colors.grey.shade600),
-                size: 16,
-              ),
-              title: Text(
-                name,
-                style: TextStyle(
-                  fontWeight: isSelected || hasRecommended ? FontWeight.bold : FontWeight.normal,
-                  color: const Color(0xFF16A34A),
-                ),
-              ),
-              subtitle: specs != null ? Text(specs.join(', '), style: const TextStyle(fontSize: 10, color: Colors.grey)) : null,
-              trailing: isSelected
-                  ? const Icon(Icons.check_circle, color: const Color(0xFF16A34A), size: 18)
-                  : (hasRecommended ? const Icon(Icons.star, color: const Color(0xFF16A34A), size: 16) : null),
-              onTap: () {
-                setState(() {
-                  _selectedHospitalId = id;
-                });
-                _fetchPreviewRoute();
-                Future.delayed(const Duration(milliseconds: 300), () {
-                  if (_pageController.hasClients) {
-                    _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
-                  }
-                });
-              },
-            ),
-          );
-        },
-      );
-    }
-
-    return Align(
-      alignment: Alignment.center,
-      child: SizedBox(
-        height: 56,
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            children: filteredHospitals.map<Widget>((h) {
-              final id = h['id'];
-              String name = h['name'] ?? '';
-              final List<dynamic>? specs = h['specialties'];
-              final hasRecommended = reqSpecialty != null && specs != null && specs.contains(reqSpecialty);
-              final isSelected = _selectedHospitalId == id;
-
-              return Container(
-                margin: const EdgeInsets.only(right: 6, bottom: 4),
-                width: 160,
-                child: InkWell(
-                   onTap: () {
-                     setState(() {
-                       _selectedHospitalId = id;
-                     });
-                     _fetchPreviewRoute();
-                     Future.delayed(const Duration(milliseconds: 300), () {
-                       if (_pageController.hasClients) {
-                         _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
-                       }
-                     });
-                   },
-                  child: Container(
-                    padding: const EdgeInsets.all(6),
-                    decoration: BoxDecoration(
-                      color: isSelected ? Colors.grey.shade100 : (hasRecommended ? Colors.grey.shade50 : Colors.white),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: isSelected ? const Color(0xFF16A34A) : (hasRecommended ? Colors.grey.shade600 : Colors.grey.shade300),
-                        width: isSelected ? 2 : 1,
+                        ],
                       ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Row(
-                          children: [
-                            Icon(
-                              Icons.local_hospital_outlined,
-                              size: 13,
-                              color: isSelected ? const Color(0xFF16A34A) : (hasRecommended ? Colors.grey.shade700 : Colors.grey.shade600),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Destination: ${_destinationHospital?['name'] ?? 'Hospital'}',
+                        style: TextStyle(color: Colors.grey.shade800, fontSize: 13),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _InfoChip(
+                              icon: Icons.schedule,
+                              label: 'ETA',
+                              value: _formatEta(_etaMinutes),
                             ),
-                            const SizedBox(width: 4),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: _InfoChip(
+                              icon: Icons.straighten,
+                              label: 'Distance',
+                              value: _formatDistance(_routeDistanceMeters),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (_statusMessage != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          _statusMessage!,
+                          style: const TextStyle(color: _green, fontSize: 12),
+                        ),
+                      ],
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          if (_activeTransit?['status'] == 'en_route')
                             Expanded(
-                              child: Text(
-                                name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontWeight: isSelected || hasRecommended ? FontWeight.bold : FontWeight.normal,
-                                  color: const Color(0xFF16A34A),
-                                  fontSize: 11,
+                              child: ElevatedButton(
+                                onPressed: _loading ? null : _handleArrived,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: _green,
+                                  foregroundColor: Colors.white,
                                 ),
+                                child: const Text('Arrived'),
                               ),
                             ),
-                          ],
-                        ),
-                        if (hasRecommended)
-                          const Text('Recommended', style: TextStyle(color: const Color(0xFF16A34A), fontSize: 8, fontWeight: FontWeight.bold))
-                        else if (specs != null && specs.isNotEmpty)
-                          Text(specs.join(', '), maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey, fontSize: 8)),
-                      ],
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildConfirmPage(ThemeData theme) {
-    final triageName = _selectedTriageCodeId != null
-        ? _triageCodes.firstWhere(
-            (tc) => tc['id'] == _selectedTriageCodeId,
-            orElse: () => {'name': 'Not Selected'},
-          )['name']
-        : 'Not Selected';
-    final issueName = _selectedEmergencyTypeId != null
-        ? _emergencyTypes.firstWhere(
-            (et) => et['id'] == _selectedEmergencyTypeId,
-            orElse: () => {'name': 'Not Selected'},
-          )['name']
-        : 'Not Selected';
-    final hospitalName = _selectedHospitalId != null
-        ? _hospitals.firstWhere(
-            (h) => h['id'] == _selectedHospitalId,
-            orElse: () => {'name': 'Not Selected'},
-          )['name']
-        : 'Not Selected';
-
-    final double buttonHeight = _isExpanded ? 46.0 : 38.0;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (_isExpanded) ...[
-          const Text('Confirm Details', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: const Color(0xFF16A34A))),
-          const SizedBox(height: 6),
-          Expanded(
-            child: ListView(
-              padding: EdgeInsets.zero,
-              children: [
-                _buildCompactSummaryItem('Triage', triageName, 0),
-                _buildCompactSummaryItem('Issue', issueName, 1),
-                _buildCompactSummaryItem('Hospital', hospitalName, 2),
-              ],
-            ),
-          ),
-        ] else ...[
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: Row(
-              children: [
-                _buildCompactSummaryItem('Triage', triageName.replaceAll('Code ', ''), 0),
-                _buildCompactSummaryItem('Issue', issueName, 1),
-                _buildCompactSummaryItem('Hospital', hospitalName, 2),
-              ],
-            ),
-          ),
-        ],
-        const SizedBox(height: 6),
-        SizedBox(
-          height: buttonHeight,
-          child: ElevatedButton(
-            onPressed: _loading ? null : _handleStartTransit,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF16A34A),
-              foregroundColor: Colors.white,
-              padding: EdgeInsets.zero,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            ),
-            child: _loading
-                ? const CircularProgressIndicator(color: Colors.white)
-                : const Text('DEPART & LOCK CORRIDOR', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildCompactSummaryItem(String label, String value, int stepIndex) {
-    return Container(
-      margin: EdgeInsets.only(right: _isExpanded ? 0 : 6, bottom: _isExpanded ? 6 : 0),
-      width: _isExpanded ? double.infinity : 110.0,
-      child: Card(
-        elevation: 0,
-        color: Colors.grey.shade50,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(6),
-          side: BorderSide(color: Colors.grey.shade300),
-        ),
-        margin: EdgeInsets.zero,
-        child: InkWell(
-          onTap: () {
-            if (_pageController.hasClients) {
-              _pageController.animateToPage(
-                stepIndex,
-                duration: const Duration(milliseconds: 300),
-                curve: Curves.easeInOut,
-              );
-            }
-          },
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(label, style: TextStyle(fontSize: _isExpanded ? 10 : 9, color: Colors.grey.shade600)),
-                      const SizedBox(height: 2),
-                      Text(
-                        value,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: const Color(0xFF16A34A)),
+                          if (_activeTransit?['status'] == 'en_route')
+                            const SizedBox(width: 8),
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: _loading ? null : _handleComplete,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: _green,
+                                side: const BorderSide(color: _green),
+                              ),
+                              child: const Text('Complete'),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
                 ),
-                const Icon(Icons.edit, size: 12, color: const Color(0xFF16A34A)),
+              ),
+            ),
+
+          if (_error != null)
+            Positioned(
+              bottom: _activeTransit == null ? 100 : 24,
+              left: 16,
+              right: 80,
+              child: Material(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(10),
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Text(
+                    _error!,
+                    style: TextStyle(
+                      color: Colors.red.shade800,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // Bottom-right + FAB to open request form
+          if (_activeTransit == null)
+            Positioned(
+              right: 20,
+              bottom: 28,
+              child: SafeArea(
+                child: FloatingActionButton(
+                  onPressed: _loading ? null : _openRequestForm,
+                  backgroundColor: _green,
+                  foregroundColor: Colors.white,
+                  tooltip: 'Request green corridor',
+                  child: const Icon(Icons.add, size: 32),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InfoChip extends StatelessWidget {
+  const _InfoChip({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF0FDF4),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFBBF7D0)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: const Color(0xFF16A34A)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+                ),
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: Color(0xFF16A34A),
+                  ),
+                ),
               ],
             ),
           ),
-        ),
+        ],
       ),
     );
   }

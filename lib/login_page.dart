@@ -12,9 +12,8 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _emailController = TextEditingController(text: 'driver@1122.pk');
-  final _passwordController = TextEditingController(text: 'password123');
-  final _apiUrlController = TextEditingController(text: 'https://gchq-backend.vercel.app/api');
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
   bool _loading = false;
   String? _error;
 
@@ -22,7 +21,6 @@ class _LoginPageState extends State<LoginPage> {
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
-    _apiUrlController.dispose();
     super.dispose();
   }
 
@@ -33,7 +31,6 @@ class _LoginPageState extends State<LoginPage> {
     });
 
     final api = ApiService();
-    api.setBaseUrl(_apiUrlController.text);
 
     try {
       final bytes = utf8.encode(_passwordController.text);
@@ -94,10 +91,12 @@ class _LoginPageState extends State<LoginPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Icon(
-                  Icons.local_hospital,
-                  size: 48,
-                  color: const Color(0xFF16A34A),
+                Center(
+                  child: Image.asset(
+                    'assets/images/gchq_logo.png',
+                    height: 96,
+                    fit: BoxFit.contain,
+                  ),
                 ),
                 const SizedBox(height: 16),
                 Text(
@@ -110,7 +109,7 @@ class _LoginPageState extends State<LoginPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Green Corridor — Paramedic Dispatch',
+                  'Paramedic Dispatch',
                   textAlign: TextAlign.center,
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: Colors.grey.shade600,
@@ -118,25 +117,13 @@ class _LoginPageState extends State<LoginPage> {
                 ),
                 const SizedBox(height: 32),
                 TextField(
-                  controller: _apiUrlController,
-                  decoration: const InputDecoration(
-                    labelText: 'API Gateway Endpoint',
-                    border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.dns, color: const Color(0xFF16A34A)),
-                    focusedBorder: OutlineInputBorder(
-                      borderSide: BorderSide(color: const Color(0xFF16A34A), width: 2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TextField(
                   controller: _emailController,
                   decoration: const InputDecoration(
                     labelText: 'Email Address',
                     border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.email, color: const Color(0xFF16A34A)),
+                    prefixIcon: Icon(Icons.email, color: Color(0xFF16A34A)),
                     focusedBorder: OutlineInputBorder(
-                      borderSide: BorderSide(color: const Color(0xFF16A34A), width: 2),
+                      borderSide: BorderSide(color: Color(0xFF16A34A), width: 2),
                     ),
                   ),
                   keyboardType: TextInputType.emailAddress,
@@ -147,9 +134,9 @@ class _LoginPageState extends State<LoginPage> {
                   decoration: const InputDecoration(
                     labelText: 'Access Password',
                     border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.lock, color: const Color(0xFF16A34A)),
+                    prefixIcon: Icon(Icons.lock, color: Color(0xFF16A34A)),
                     focusedBorder: OutlineInputBorder(
-                      borderSide: BorderSide(color: const Color(0xFF16A34A), width: 2),
+                      borderSide: BorderSide(color: Color(0xFF16A34A), width: 2),
                     ),
                   ),
                   obscureText: true,
@@ -159,7 +146,7 @@ class _LoginPageState extends State<LoginPage> {
                   Text(
                     _error!,
                     style: const TextStyle(
-                      color: const Color(0xFF16A34A),
+                      color: Color(0xFF16A34A),
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
                     ),
@@ -193,17 +180,6 @@ class _LoginPageState extends State<LoginPage> {
                             fontWeight: FontWeight.bold,
                           ),
                         ),
-                ),
-                const SizedBox(height: 24),
-                const Divider(),
-                const SizedBox(height: 12),
-                const Text(
-                  'Demo Accounts: driver@1122.pk | password123',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Color(0xFF64748B),
-                    fontSize: 11,
-                  ),
                 ),
               ],
             ),
