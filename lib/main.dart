@@ -3,10 +3,28 @@ import 'api_service.dart';
 import 'login_page.dart';
 import 'home_page.dart';
 
+final navigatorKey = GlobalKey<NavigatorState>();
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final api = ApiService();
   await api.loadSavedAuth();
+
+  // Server returned 401 (token expired/revoked): force re-login.
+  api.onSessionExpired = () {
+    final navigator = navigatorKey.currentState;
+    if (navigator == null) return;
+    navigator.pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginPage()),
+      (route) => false,
+    );
+    final ctx = navigatorKey.currentContext;
+    if (ctx != null) {
+      ScaffoldMessenger.of(ctx).showSnackBar(
+        const SnackBar(content: Text('Session expired. Please log in again.')),
+      );
+    }
+  };
 
   runApp(const GreenCorridorApp());
 }
@@ -20,6 +38,7 @@ class GreenCorridorApp extends StatelessWidget {
     final isLoggedIn = api.token != null && api.user != null;
 
     return MaterialApp(
+      navigatorKey: navigatorKey,
       title: 'Green Corridor',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
