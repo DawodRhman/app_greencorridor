@@ -107,6 +107,30 @@ class ApiService {
     throw Exception(_parseError(res, 'Failed to load hospitals'));
   }
 
+  /// Hospitals that cater the selected emergency type, nearest first.
+  /// Response: { recommendedHospitalId, selectionReason, hospitals: [...] }
+  Future<Map<String, dynamic>> fetchSuitableHospitals({
+    required String cityId,
+    required String emergencyTypeId,
+    required double latitude,
+    required double longitude,
+  }) async {
+    final uri = Uri.parse('$_baseUrl/hospitals/suitable').replace(
+      queryParameters: {
+        'cityId': cityId,
+        'emergencyTypeId': emergencyTypeId,
+        'latitude': latitude.toString(),
+        'longitude': longitude.toString(),
+      },
+    );
+    final res = await http.get(uri, headers: _headers());
+    if (res.statusCode == 200) {
+      final data = json.decode(res.body);
+      if (data is Map) return Map<String, dynamic>.from(data);
+    }
+    throw Exception(_parseError(res, 'Failed to load suitable hospitals'));
+  }
+
   Future<List<dynamic>> fetchEmergencyTypes() async {
     final res = await http.get(
       Uri.parse('$_baseUrl/emergency-types'),
