@@ -650,10 +650,32 @@ class _HomePageState extends State<HomePage> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Select destination hospital, triage, and emergency type.',
+                      'Select emergency type, hospital, and triage code.',
                       style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
                     ),
                     const SizedBox(height: 20),
+                    DropdownButtonFormField<String>(
+                      value: emergencyId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Emergency type',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.medical_services, color: _green),
+                      ),
+                      items: _emergencyTypes.map<DropdownMenuItem<String>>((e) {
+                        return DropdownMenuItem<String>(
+                          value: e['id']?.toString(),
+                          child: Text(
+                            e['name']?.toString() ?? 'Emergency',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: submitting
+                          ? null
+                          : (v) => setSheetState(() => emergencyId = v),
+                    ),
+                    const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
                       value: hospitalId,
                       isExpanded: true,
@@ -695,28 +717,6 @@ class _HomePageState extends State<HomePage> {
                           : (v) => setSheetState(() => triageId = v),
                     ),
                     const SizedBox(height: 12),
-                    DropdownButtonFormField<String>(
-                      value: emergencyId,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Emergency type',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.medical_services, color: _green),
-                      ),
-                      items: _emergencyTypes.map<DropdownMenuItem<String>>((e) {
-                        return DropdownMenuItem<String>(
-                          value: e['id']?.toString(),
-                          child: Text(
-                            e['name']?.toString() ?? 'Emergency',
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        );
-                      }).toList(),
-                      onChanged: submitting
-                          ? null
-                          : (v) => setSheetState(() => emergencyId = v),
-                    ),
-                    const SizedBox(height: 12),
                     TextField(
                       controller: notesController,
                       enabled: !submitting,
@@ -744,11 +744,11 @@ class _HomePageState extends State<HomePage> {
                       onPressed: submitting
                           ? null
                           : () async {
-                              if (hospitalId == null ||
-                                  triageId == null ||
-                                  emergencyId == null) {
+                              if (emergencyId == null ||
+                                  hospitalId == null ||
+                                  triageId == null) {
                                 setSheetState(() {
-                                  formError = 'Please select hospital, triage, and emergency type.';
+                                  formError = 'Please select emergency type, hospital, and triage code.';
                                 });
                                 return;
                               }
