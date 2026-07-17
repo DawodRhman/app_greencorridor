@@ -26,6 +26,12 @@ class ApiService {
   /// force re-login. Set from main.dart.
   void Function()? onSessionExpired;
 
+  /// Set when the server returns 429; telemetry senders check this and skip
+  /// sending until the window has passed (no tight retry loops).
+  DateTime? _rateLimitedUntil;
+  bool get isRateLimited =>
+      _rateLimitedUntil != null && DateTime.now().isBefore(_rateLimitedUntil!);
+
   String get baseUrl => _baseUrl;
   String? get token => _token;
   String? get apiKey => _apiKey;
@@ -192,6 +198,11 @@ class ApiService {
       await _clearLocalAuth();
       onSessionExpired?.call();
     }
+    if (res.statusCode == 429) {
+      final retryAfter = int.tryParse(res.headers['retry-after'] ?? '');
+      _rateLimitedUntil =
+          DateTime.now().add(Duration(seconds: retryAfter ?? 5));
+    }
     return res;
   }
 
@@ -206,6 +217,9 @@ class ApiService {
   String _parseError(http.Response res, String fallback) {
     if (res.statusCode == 401) {
       return 'Session expired. Please log in again.';
+    }
+    if (res.statusCode == 429) {
+      return 'Too many requests. Backing off — will retry shortly.';
     }
     try {
       final err = json.decode(res.body);

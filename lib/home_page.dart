@@ -336,6 +336,13 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _syncGpsToServer({bool force = false}) async {
     if (_gpsBusy && !force) return;
+    if (_api.isRateLimited) {
+      // 429 backoff: skip this cycle; the 15s periodic timer retries naturally.
+      if (mounted) {
+        setState(() => _gpsStatus = 'GPS paused briefly (rate limit) — retrying soon');
+      }
+      return;
+    }
     if (_ambulanceId == null || _ambulanceId!.isEmpty) {
       if (mounted) {
         setState(() {
@@ -540,6 +547,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _pushEtaToBackend(double etaMinutes) async {
+    // 429 backoff: skip this push; the next GPS cycle sends a fresh ETA.
+    if (_api.isRateLimited) return;
     final transitId = _activeTransit?['id']?.toString();
     if (transitId == null || transitId.isEmpty) return;
 
