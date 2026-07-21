@@ -1034,9 +1034,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _handleLogout() async {
+    // Stop GPS transmission before revoking the token.
     _gpsSyncTimer?.cancel();
     await _positionSub?.cancel();
-    await _api.logout();
+    await _api.postAuditEvent('mobile_logout');
+    await _api.logout(
+      latitude: _devicePosition?.latitude,
+      longitude: _devicePosition?.longitude,
+    );
     if (mounted) {
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(builder: (_) => const LoginPage()),

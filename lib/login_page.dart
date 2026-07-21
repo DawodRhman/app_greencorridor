@@ -46,6 +46,8 @@ class _LoginPageState extends State<LoginPage> {
         throw Exception('Access denied. Only paramedic staff may use this application.');
       }
 
+      api.postAuditEvent('mobile_login'); // best-effort, non-blocking
+
       if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const HomePage()),

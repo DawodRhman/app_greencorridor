@@ -1,7 +1,9 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:socket_io_client/socket_io_client.dart' as socket_io;
 
 class ApiService {
   static final ApiService _instance = ApiService._internal();
@@ -31,6 +33,9 @@ class ApiService {
   DateTime? _rateLimitedUntil;
   bool get isRateLimited =>
       _rateLimitedUntil != null && DateTime.now().isBefore(_rateLimitedUntil!);
+
+  /// Socket used only to receive the auth:revoked event.
+  socket_io.Socket? _revocationSocket;
 
   String get baseUrl => _baseUrl;
   String? get token => _token;
@@ -76,6 +81,48 @@ class ApiService {
         _user = null;
       }
     }
+
+    if (_token != null) connectRevocationSocket();
+  }
+
+  /// Stable per-install id sent with logout / audit events.
+  Future<String> deviceId() async {
+    final prefs = await SharedPreferences.getInstance();
+    var id = prefs.getString('deviceId');
+    if (id == null) {
+      id = 'mob-${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}'
+          '-${Random().nextInt(0x7fffffff).toRadixString(36)}';
+      await prefs.setString('deviceId', id);
+    }
+    return id;
+  }
+
+  /// Listens for the auth:revoked WebSocket event. When it fires, the token
+  /// is erased and onSessionExpired sends the user back to login (the HomePage
+  /// teardown stops GPS transmission).
+  void connectRevocationSocket() {
+    if (_token == null) return;
+    _revocationSocket?.dispose();
+
+    // Socket server lives on the same host, without the /api suffix.
+    final wsUrl = _baseUrl.replaceFirst(RegExp(r'/api/?$'), '');
+    final socket = socket_io.io(
+      wsUrl,
+      socket_io.OptionBuilder()
+          .setTransports(['websocket'])
+          .setAuth({'token': _token})
+          .enableReconnection()
+          .build(),
+    );
+    socket.on('auth:revoked', (_) => _forceSessionExpired());
+    _revocationSocket = socket;
+  }
+
+  Future<void> _forceSessionExpired() async {
+    if (_token == null) return;
+    _token = null; // sync, so 401s and auth:revoked only trigger this once
+    await _clearLocalAuth();
+    onSessionExpired?.call();
   }
 
   /// "8h" / "30m" / "7d" → Duration. Defaults to 8 hours.
@@ -129,6 +176,7 @@ class ApiService {
       if (_user?['cityId'] != null) {
         await prefs.setString('selectedCityId', _user?['cityId']);
       }
+      connectRevocationSocket();
       return data;
     }
 
@@ -139,20 +187,46 @@ class ApiService {
     throw Exception(_parseError(res, 'Login failed'));
   }
 
-  /// Revokes the token server-side, then clears it locally. Local auth is
-  /// cleared even if the network call fails, so the user is always signed out.
-  Future<void> logout() async {
-    final activeToken = _token;
-    if (activeToken != null) {
+  /// Revokes the token server-side (with last known position + device id),
+  /// then clears it locally. Local auth is cleared even if the network call
+  /// fails, so the user is always signed out.
+  Future<void> logout({double? latitude, double? longitude}) async {
+    if (_token != null) {
       try {
         await http
-            .post(Uri.parse('$_baseUrl/auth/logout'), headers: _headers())
+            .post(
+              Uri.parse('$_baseUrl/auth/logout'),
+              headers: _headers(),
+              body: json.encode({
+                if (latitude != null) 'latitude': latitude,
+                if (longitude != null) 'longitude': longitude,
+                'deviceId': await deviceId(),
+              }),
+            )
             .timeout(const Duration(seconds: 5));
       } catch (_) {
         // Token expires server-side in <=8h anyway; local clear is the priority.
       }
     }
     await _clearLocalAuth();
+  }
+
+  /// Best-effort audit trail of mobile actions (POST /audit-events).
+  /// Never throws and never blocks the calling flow.
+  Future<void> postAuditEvent(String action, {Map<String, dynamic>? details}) async {
+    if (_token == null) return;
+    try {
+      await _authPost(
+        Uri.parse('$_baseUrl/audit-events'),
+        body: json.encode({
+          'action': action,
+          'deviceId': await deviceId(),
+          if (details != null) 'details': details,
+        }),
+      ).timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // Auditing is optional; failures must not affect the app.
+    }
   }
 
   /// Optional session check: POST /auth/me. Returns false when the token
@@ -169,6 +243,8 @@ class ApiService {
   }
 
   Future<void> _clearLocalAuth() async {
+    _revocationSocket?.dispose();
+    _revocationSocket = null;
     _token = null;
     _apiKey = null;
     _user = null;
@@ -193,10 +269,9 @@ class ApiService {
   /// token was revoked/expired, so clear it and force re-login.
   Future<http.Response> _guard(Future<http.Response> request) async {
     final res = await request;
-    if (res.statusCode == 401 && _token != null) {
-      _token = null; // set synchronously so concurrent 401s fire this once
-      await _clearLocalAuth();
-      onSessionExpired?.call();
+    if (res.statusCode == 401) {
+      // Same handling as the auth:revoked WebSocket event.
+      await _forceSessionExpired();
     }
     if (res.statusCode == 429) {
       final retryAfter = int.tryParse(res.headers['retry-after'] ?? '');
