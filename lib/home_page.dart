@@ -616,6 +616,7 @@ class _HomePageState extends State<HomePage> {
     String? hospitalId;
     String? triageId;
     String? emergencyId;
+    String? hospitalChoiceConsent; // "pc" | "ac"
     List<Map<String, dynamic>> suitableHospitals = [];
     String? recommendedHospitalId;
     var loadingHospitals = false;
@@ -624,10 +625,17 @@ class _HomePageState extends State<HomePage> {
     var submitting = false;
     String? formError;
 
+    final isTablet = _isTablet(context);
+
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.white,
+      // Keep the form readable on 7"+ tablets (centered, capped width).
+      constraints: BoxConstraints(
+        maxWidth: isTablet ? 560 : double.infinity,
+        maxHeight: MediaQuery.of(context).size.height * 0.92,
+      ),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -635,6 +643,7 @@ class _HomePageState extends State<HomePage> {
         return StatefulBuilder(
           builder: (ctx, setSheetState) {
             final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
+            final sheetPad = isTablet ? 28.0 : 20.0;
 
             Future<void> loadSuitableHospitals(String forEmergencyId) async {
               final cityId = (_myAmbulance?['cityId'] ?? _api.user?['cityId'])?.toString();
@@ -689,7 +698,7 @@ class _HomePageState extends State<HomePage> {
               }
             }
             return Padding(
-              padding: EdgeInsets.fromLTRB(20, 12, 20, 20 + bottomInset),
+              padding: EdgeInsets.fromLTRB(sheetPad, 12, sheetPad, 20 + bottomInset),
               child: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -851,6 +860,109 @@ class _HomePageState extends State<HomePage> {
                         prefixIcon: Icon(Icons.notes, color: _green),
                       ),
                     ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Hospital choice consent',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF334155),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: submitting
+                                ? null
+                                : () => setSheetState(() {
+                                      hospitalChoiceConsent = 'pc';
+                                      formError = null;
+                                    }),
+                            style: OutlinedButton.styleFrom(
+                              backgroundColor: hospitalChoiceConsent == 'pc'
+                                  ? _green.withValues(alpha: 0.1)
+                                  : Colors.white,
+                              foregroundColor: hospitalChoiceConsent == 'pc'
+                                  ? _green
+                                  : Colors.grey.shade700,
+                              side: BorderSide(
+                                color: hospitalChoiceConsent == 'pc'
+                                    ? _green
+                                    : Colors.grey.shade300,
+                                width: hospitalChoiceConsent == 'pc' ? 2 : 1,
+                              ),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: const Column(
+                              children: [
+                                Text(
+                                  'PC',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  'Patient Choice',
+                                  style: TextStyle(fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: submitting
+                                ? null
+                                : () => setSheetState(() {
+                                      hospitalChoiceConsent = 'ac';
+                                      formError = null;
+                                    }),
+                            style: OutlinedButton.styleFrom(
+                              backgroundColor: hospitalChoiceConsent == 'ac'
+                                  ? _green.withValues(alpha: 0.1)
+                                  : Colors.white,
+                              foregroundColor: hospitalChoiceConsent == 'ac'
+                                  ? _green
+                                  : Colors.grey.shade700,
+                              side: BorderSide(
+                                color: hospitalChoiceConsent == 'ac'
+                                    ? _green
+                                    : Colors.grey.shade300,
+                                width: hospitalChoiceConsent == 'ac' ? 2 : 1,
+                              ),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: const Column(
+                              children: [
+                                Text(
+                                  'AC',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  'Ambulance Choice',
+                                  style: TextStyle(fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                     if (formError != null) ...[
                       const SizedBox(height: 12),
                       Text(
@@ -872,6 +984,14 @@ class _HomePageState extends State<HomePage> {
                                   triageId == null) {
                                 setSheetState(() {
                                   formError = 'Please select emergency type, hospital, and triage code.';
+                                });
+                                return;
+                              }
+                              if (hospitalChoiceConsent != 'pc' &&
+                                  hospitalChoiceConsent != 'ac') {
+                                setSheetState(() {
+                                  formError =
+                                      'Please select Patient Choice (PC) or Ambulance Choice (AC) before requesting the corridor.';
                                 });
                                 return;
                               }
@@ -898,6 +1018,7 @@ class _HomePageState extends State<HomePage> {
                                   triageId: triageId!,
                                   emergencyId: emergencyId!,
                                   notes: notesController.text.trim(),
+                                  hospitalChoiceConsent: hospitalChoiceConsent!,
                                 );
                                 if (ctx.mounted) Navigator.of(ctx).pop();
                               } catch (e) {
@@ -952,6 +1073,7 @@ class _HomePageState extends State<HomePage> {
     required String triageId,
     required String emergencyId,
     required String notes,
+    required String hospitalChoiceConsent,
   }) async {
     final origin = _devicePosition ??
         LatLng(
@@ -966,6 +1088,7 @@ class _HomePageState extends State<HomePage> {
       hospitalId: hospital['id'].toString(),
       emergencyTypeId: emergencyId,
       triageCodeId: triageId,
+      hospitalChoiceConsent: hospitalChoiceConsent,
       sectorId: hospital['sectorId']?.toString(),
       paramedicNotes: notes.isEmpty ? null : notes,
       originLat: origin.latitude,
@@ -1049,6 +1172,17 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// 7"+ tablets (Material large breakpoint) get centered, capped overlays.
+  bool _isTablet(BuildContext context) =>
+      MediaQuery.of(context).size.shortestSide >= 600;
+
+  double _overlayInset(BuildContext context, {double phoneInset = 12}) {
+    final width = MediaQuery.of(context).size.width;
+    if (!_isTablet(context)) return phoneInset;
+    const maxOverlay = 560.0;
+    return ((width - maxOverlay) / 2).clamp(phoneInset, width / 2);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_initializing) {
@@ -1056,6 +1190,10 @@ class _HomePageState extends State<HomePage> {
         body: Center(child: CircularProgressIndicator(color: _green)),
       );
     }
+
+    final isTablet = _isTablet(context);
+    final overlayInset = _overlayInset(context);
+    final topBarInset = _overlayInset(context, phoneInset: 12);
 
     final mapCenter = _devicePosition ??
         (_myAmbulance != null
@@ -1071,8 +1209,8 @@ class _HomePageState extends State<HomePage> {
     final markers = <Marker>[
       Marker(
         point: mapCenter,
-        width: 52,
-        height: 52,
+        width: isTablet ? 60 : 52,
+        height: isTablet ? 60 : 52,
         child: Container(
           decoration: BoxDecoration(
             color: _green,
@@ -1081,7 +1219,7 @@ class _HomePageState extends State<HomePage> {
               BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 3)),
             ],
           ),
-          child: const Icon(Icons.local_shipping, color: Colors.white, size: 26),
+          child: Icon(Icons.local_shipping, color: Colors.white, size: isTablet ? 30 : 26),
         ),
       ),
     ];
@@ -1090,8 +1228,8 @@ class _HomePageState extends State<HomePage> {
       markers.add(
         Marker(
           point: hospitalPoint,
-          width: 56,
-          height: 56,
+          width: isTablet ? 64 : 56,
+          height: isTablet ? 64 : 56,
           child: Container(
             decoration: BoxDecoration(
               color: Colors.white,
@@ -1101,7 +1239,7 @@ class _HomePageState extends State<HomePage> {
                 BoxShadow(color: Colors.black38, blurRadius: 8, offset: Offset(0, 3)),
               ],
             ),
-            child: const Icon(Icons.local_hospital, color: _green, size: 28),
+            child: Icon(Icons.local_hospital, color: _green, size: isTablet ? 32 : 28),
           ),
         ),
       );
@@ -1114,7 +1252,7 @@ class _HomePageState extends State<HomePage> {
             mapController: _mapController,
             options: MapOptions(
               initialCenter: mapCenter,
-              initialZoom: 14.5,
+              initialZoom: isTablet ? 14.0 : 14.5,
               onMapReady: () {
                 _mapReady = true;
               },
@@ -1132,7 +1270,7 @@ class _HomePageState extends State<HomePage> {
                   polylines: [
                     Polyline(
                       points: _routePoints,
-                      strokeWidth: 5,
+                      strokeWidth: isTablet ? 6 : 5,
                       color: _green,
                     ),
                   ],
@@ -1141,10 +1279,10 @@ class _HomePageState extends State<HomePage> {
             ],
           ),
 
-          // Top bar
+          // Top bar — capped width on tablets so it doesn't stretch edge-to-edge
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              padding: EdgeInsets.fromLTRB(topBarInset, 8, topBarInset, 0),
               child: Row(
                 children: [
                   Expanded(
@@ -1153,22 +1291,28 @@ class _HomePageState extends State<HomePage> {
                       borderRadius: BorderRadius.circular(12),
                       color: Colors.white,
                       child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        padding: EdgeInsets.symmetric(
+                          horizontal: isTablet ? 16 : 12,
+                          vertical: isTablet ? 12 : 10,
+                        ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Text(
                               _myAmbulance?['unitNumber']?.toString() ?? 'No unit assigned',
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 color: _green,
-                                fontSize: 15,
+                                fontSize: isTablet ? 17 : 15,
                               ),
                             ),
                             Text(
                               _api.user?['name']?.toString() ?? '',
-                              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                              style: TextStyle(
+                                fontSize: isTablet ? 13 : 12,
+                                color: Colors.grey.shade600,
+                              ),
                             ),
                             if (_gpsStatus != null)
                               Text(
@@ -1176,7 +1320,7 @@ class _HomePageState extends State<HomePage> {
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  fontSize: 10,
+                                  fontSize: isTablet ? 11 : 10,
                                   color: _gpsStatus!.contains('failed') ||
                                           _gpsStatus!.contains('not sent')
                                       ? Colors.red.shade700
@@ -1195,6 +1339,7 @@ class _HomePageState extends State<HomePage> {
                     borderRadius: BorderRadius.circular(12),
                     child: IconButton(
                       tooltip: 'Recenter',
+                      iconSize: isTablet ? 26 : 24,
                       icon: const Icon(Icons.my_location, color: _green),
                       onPressed: () {
                         if (_devicePosition != null) {
@@ -1211,6 +1356,7 @@ class _HomePageState extends State<HomePage> {
                     borderRadius: BorderRadius.circular(12),
                     child: IconButton(
                       tooltip: 'Logout',
+                      iconSize: isTablet ? 26 : 24,
                       icon: const Icon(Icons.logout, color: _green),
                       onPressed: _handleLogout,
                     ),
@@ -1222,15 +1368,15 @@ class _HomePageState extends State<HomePage> {
 
           if (_activeTransit != null)
             Positioned(
-              top: MediaQuery.of(context).padding.top + 72,
-              left: 12,
-              right: 12,
+              top: MediaQuery.of(context).padding.top + (isTablet ? 84 : 72),
+              left: overlayInset,
+              right: overlayInset,
               child: Material(
                 elevation: 4,
                 borderRadius: BorderRadius.circular(14),
                 color: Colors.white,
                 child: Padding(
-                  padding: const EdgeInsets.all(14),
+                  padding: EdgeInsets.all(isTablet ? 18 : 14),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -1257,15 +1403,18 @@ class _HomePageState extends State<HomePage> {
                               _activeTransit?['transitId']?.toString() ??
                                   _activeTransit?['id']?.toString() ??
                                   'Corridor active',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: isTablet ? 16 : 14,
+                              ),
                             ),
                           ),
                           Text(
                             (_activeTransit?['status'] ?? '').toString().toUpperCase(),
-                            style: const TextStyle(
+                            style: TextStyle(
                               color: _green,
                               fontWeight: FontWeight.w700,
-                              fontSize: 12,
+                              fontSize: isTablet ? 13 : 12,
                             ),
                           ),
                         ],
@@ -1273,7 +1422,10 @@ class _HomePageState extends State<HomePage> {
                       const SizedBox(height: 8),
                       Text(
                         'Destination: ${_destinationHospital?['name'] ?? 'Hospital'}',
-                        style: TextStyle(color: Colors.grey.shade800, fontSize: 13),
+                        style: TextStyle(
+                          color: Colors.grey.shade800,
+                          fontSize: isTablet ? 15 : 13,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Row(
@@ -1299,7 +1451,10 @@ class _HomePageState extends State<HomePage> {
                         const SizedBox(height: 4),
                         Text(
                           _statusMessage!,
-                          style: const TextStyle(color: _green, fontSize: 12),
+                          style: TextStyle(
+                            color: _green,
+                            fontSize: isTablet ? 13 : 12,
+                          ),
                         ),
                       ],
                       const SizedBox(height: 10),
@@ -1312,6 +1467,7 @@ class _HomePageState extends State<HomePage> {
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: _green,
                                   foregroundColor: Colors.white,
+                                  minimumSize: Size.fromHeight(isTablet ? 48 : 40),
                                 ),
                                 child: const Text('Arrived'),
                               ),
@@ -1324,6 +1480,7 @@ class _HomePageState extends State<HomePage> {
                               style: OutlinedButton.styleFrom(
                                 foregroundColor: _green,
                                 side: const BorderSide(color: _green),
+                                minimumSize: Size.fromHeight(isTablet ? 48 : 40),
                               ),
                               child: const Text('Complete'),
                             ),
@@ -1338,9 +1495,9 @@ class _HomePageState extends State<HomePage> {
 
           if (_error != null)
             Positioned(
-              bottom: _activeTransit == null ? 100 : 24,
-              left: 16,
-              right: 80,
+              bottom: _activeTransit == null ? (isTablet ? 110 : 100) : 24,
+              left: overlayInset,
+              right: isTablet ? overlayInset : 80,
               child: Material(
                 color: Colors.red.shade50,
                 borderRadius: BorderRadius.circular(10),
@@ -1350,7 +1507,7 @@ class _HomePageState extends State<HomePage> {
                     _error!,
                     style: TextStyle(
                       color: Colors.red.shade800,
-                      fontSize: 12,
+                      fontSize: isTablet ? 13 : 12,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -1361,15 +1518,15 @@ class _HomePageState extends State<HomePage> {
           // Bottom-right + FAB to open request form
           if (_activeTransit == null)
             Positioned(
-              right: 20,
-              bottom: 28,
+              right: isTablet ? 28 : 20,
+              bottom: isTablet ? 32 : 28,
               child: SafeArea(
                 child: FloatingActionButton(
                   onPressed: _loading ? null : _openRequestForm,
                   backgroundColor: _green,
                   foregroundColor: Colors.white,
                   tooltip: 'Request green corridor',
-                  child: const Icon(Icons.add, size: 32),
+                  child: Icon(Icons.add, size: isTablet ? 36 : 32),
                 ),
               ),
             ),

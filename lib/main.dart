@@ -54,7 +54,22 @@ class GreenCorridorApp extends StatelessWidget {
           contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 16),
           floatingLabelBehavior: FloatingLabelBehavior.auto,
         ),
+        // Comfortable tap targets on 7"+ tablets without oversizing phones.
+        visualDensity: VisualDensity.standard,
+        materialTapTargetSize: MaterialTapTargetSize.padded,
       ),
+      builder: (context, child) {
+        // Keep readable text on tablets; clamp extreme system font scales.
+        final media = MediaQuery.of(context);
+        final clamped = media.textScaler.clamp(
+          minScaleFactor: 0.9,
+          maxScaleFactor: 1.3,
+        );
+        return MediaQuery(
+          data: media.copyWith(textScaler: clamped),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
       home: isLoggedIn ? const HomePage() : const LoginPage(),
     );
   }

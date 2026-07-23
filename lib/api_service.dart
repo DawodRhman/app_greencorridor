@@ -377,6 +377,7 @@ class ApiService {
     required String hospitalId,
     required String emergencyTypeId,
     required String triageCodeId,
+    required String hospitalChoiceConsent, // "pc" | "ac"
     String? sectorId,
     String? paramedicNotes,
     required double originLat,
@@ -390,6 +391,7 @@ class ApiService {
         'hospitalId': hospitalId,
         'emergencyTypeId': emergencyTypeId,
         'triageCodeId': triageCodeId,
+        'hospitalChoiceConsent': hospitalChoiceConsent,
         if (sectorId != null) 'sectorId': sectorId,
         if (paramedicNotes != null && paramedicNotes.isNotEmpty)
           'paramedicNotes': paramedicNotes,
