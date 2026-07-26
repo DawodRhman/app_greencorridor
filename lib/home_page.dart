@@ -618,10 +618,17 @@ class _HomePageState extends State<HomePage> {
     String? emergencyId;
     String? hospitalChoiceConsent; // "pc" | "ac"
     List<Map<String, dynamic>> suitableHospitals = [];
+    // Start with the full cached list; search (≥3 chars) narrows via API.
+    List<dynamic> emergencyOptions = List<dynamic>.from(_emergencyTypes);
     String? recommendedHospitalId;
     var loadingHospitals = false;
+    var loadingEmergencies = false;
     var noHospitals = false;
     final notesController = TextEditingController();
+    final emergencySearchController = TextEditingController();
+    final hospitalSearchController = TextEditingController();
+    Timer? emergencySearchDebounce;
+    Timer? hospitalSearchDebounce;
     var submitting = false;
     String? formError;
 
@@ -645,24 +652,91 @@ class _HomePageState extends State<HomePage> {
             final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
             final sheetPad = isTablet ? 28.0 : 20.0;
 
-            Future<void> loadSuitableHospitals(String forEmergencyId) async {
-              final cityId = (_myAmbulance?['cityId'] ?? _api.user?['cityId'])?.toString();
+            InputDecoration searchDecoration(String hint) => InputDecoration(
+                  hintText: hint,
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  prefixIcon: const Icon(Icons.search, color: _green, size: 22),
+                  suffixIcon: null,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 12,
+                  ),
+                );
+
+            Future<void> loadEmergencyOptions(String rawQuery) async {
+              final query = rawQuery.trim();
+              // < 3 chars → full list (no server filter)
+              if (query.length < 3) {
+                setSheetState(() {
+                  loadingEmergencies = false;
+                  emergencyOptions = List<dynamic>.from(_emergencyTypes);
+                  // Keep current selection even if user clears search
+                });
+                return;
+              }
+              final requestQuery = query;
+              try {
+                final list = await _api.fetchEmergencyTypes(q: requestQuery);
+                if (emergencySearchController.text.trim() != requestQuery) {
+                  return; // stale
+                }
+                setSheetState(() {
+                  loadingEmergencies = false;
+                  emergencyOptions = list;
+                  // Keep selection if still present; otherwise clear it
+                  if (emergencyId != null &&
+                      !list.any((e) => e['id']?.toString() == emergencyId)) {
+                    emergencyId = null;
+                    hospitalId = null;
+                    suitableHospitals = [];
+                    recommendedHospitalId = null;
+                    noHospitals = false;
+                    hospitalSearchController.clear();
+                  }
+                });
+              } catch (e) {
+                if (emergencySearchController.text.trim() != requestQuery) {
+                  return;
+                }
+                setSheetState(() {
+                  loadingEmergencies = false;
+                  formError = e.toString().replaceAll('Exception: ', '');
+                });
+              }
+            }
+
+            Future<void> loadSuitableHospitals(
+              String forEmergencyId, {
+              String? hospitalQuery,
+            }) async {
+              final cityId =
+                  (_myAmbulance?['cityId'] ?? _api.user?['cityId'])?.toString();
               final origin = _devicePosition ??
                   LatLng(
-                    double.tryParse(_myAmbulance?['currentLat']?.toString() ?? '') ??
+                    double.tryParse(
+                            _myAmbulance?['currentLat']?.toString() ?? '') ??
                         _lahoreCenter.latitude,
-                    double.tryParse(_myAmbulance?['currentLng']?.toString() ?? '') ??
+                    double.tryParse(
+                            _myAmbulance?['currentLng']?.toString() ?? '') ??
                         _lahoreCenter.longitude,
                   );
+              final q = (hospitalQuery ?? hospitalSearchController.text).trim();
               try {
                 final data = await _api.fetchSuitableHospitals(
                   cityId: cityId ?? '',
                   emergencyTypeId: forEmergencyId,
                   latitude: origin.latitude,
                   longitude: origin.longitude,
+                  q: q.length >= 3 ? q : null,
                 );
                 // Ignore stale responses if the user changed emergency type again
                 if (emergencyId != forEmergencyId) return;
+                // Ignore stale hospital search responses
+                final currentQ = hospitalSearchController.text.trim();
+                final expectedQ = q.length >= 3 ? q : '';
+                final activeQ = currentQ.length >= 3 ? currentQ : '';
+                if (expectedQ != activeQ) return;
 
                 // Keep server order unchanged: it is already nearest-to-farthest
                 final list = (data['hospitals'] as List? ?? [])
@@ -670,20 +744,28 @@ class _HomePageState extends State<HomePage> {
                     .map((h) => Map<String, dynamic>.from(h))
                     .toList();
                 final recommendedId = data['recommendedHospitalId']?.toString();
+                final searching = q.length >= 3;
 
                 setSheetState(() {
                   loadingHospitals = false;
                   suitableHospitals = list;
                   recommendedHospitalId = recommendedId;
-                  noHospitals = list.isEmpty;
+                  noHospitals = list.isEmpty && !searching;
                   if (list.isEmpty) {
                     hospitalId = null;
-                  } else if (list.length == 1) {
+                  } else if (hospitalId != null &&
+                      list.any((h) => h['id']?.toString() == hospitalId)) {
+                    // Keep the driver's current pick when it remains in results
+                  } else if (!searching && list.length == 1) {
                     hospitalId = list.first['id']?.toString();
+                  } else if (!searching) {
+                    hospitalId =
+                        list.any((h) => h['id']?.toString() == recommendedId)
+                            ? recommendedId
+                            : list.first['id']?.toString();
                   } else {
-                    hospitalId = list.any((h) => h['id']?.toString() == recommendedId)
-                        ? recommendedId
-                        : list.first['id']?.toString();
+                    // While searching, don't auto-pick — only clear if gone
+                    hospitalId = null;
                   }
                 });
               } catch (e) {
@@ -697,8 +779,43 @@ class _HomePageState extends State<HomePage> {
                 });
               }
             }
+
+            void onEmergencySearchChanged(String value) {
+              emergencySearchDebounce?.cancel();
+              if (value.trim().length < 3) {
+                loadEmergencyOptions(value);
+                return;
+              }
+              setSheetState(() => loadingEmergencies = true);
+              emergencySearchDebounce = Timer(
+                const Duration(milliseconds: 300),
+                () => loadEmergencyOptions(value),
+              );
+            }
+
+            void onHospitalSearchChanged(String value) {
+              if (emergencyId == null) return;
+              hospitalSearchDebounce?.cancel();
+              setSheetState(() => loadingHospitals = true);
+              hospitalSearchDebounce = Timer(
+                const Duration(milliseconds: 300),
+                () => loadSuitableHospitals(emergencyId!, hospitalQuery: value),
+              );
+            }
+
+            // Ensure dropdown value exists in items (avoids Flutter assert).
+            final emergencyValue = emergencyOptions
+                    .any((e) => e['id']?.toString() == emergencyId)
+                ? emergencyId
+                : null;
+            final hospitalValue = suitableHospitals
+                    .any((h) => h['id']?.toString() == hospitalId)
+                ? hospitalId
+                : null;
+
             return Padding(
-              padding: EdgeInsets.fromLTRB(sheetPad, 12, sheetPad, 20 + bottomInset),
+              padding: EdgeInsets.fromLTRB(
+                  sheetPad, 12, sheetPad, 20 + bottomInset),
               child: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -726,18 +843,48 @@ class _HomePageState extends State<HomePage> {
                     const SizedBox(height: 4),
                     Text(
                       'Select emergency type, hospital, and triage code.',
-                      style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+                      style: TextStyle(
+                          fontSize: 13, color: Colors.grey.shade600),
                     ),
                     const SizedBox(height: 20),
-                    DropdownButtonFormField<String>(
-                      value: emergencyId,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Emergency type',
-                        border: OutlineInputBorder(),
-                        prefixIcon: Icon(Icons.medical_services, color: _green),
+                    TextField(
+                      controller: emergencySearchController,
+                      enabled: !submitting,
+                      textInputAction: TextInputAction.search,
+                      decoration: searchDecoration(
+                        'Search emergency type (min 3 letters)',
+                      ).copyWith(
+                        suffixIcon: emergencySearchController.text.isEmpty
+                            ? null
+                            : IconButton(
+                                icon: const Icon(Icons.clear, size: 18),
+                                onPressed: submitting
+                                    ? null
+                                    : () {
+                                        emergencySearchController.clear();
+                                        onEmergencySearchChanged('');
+                                        setSheetState(() {});
+                                      },
+                              ),
                       ),
-                      items: _emergencyTypes.map<DropdownMenuItem<String>>((e) {
+                      onChanged: submitting ? null : onEmergencySearchChanged,
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: emergencyValue,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: loadingEmergencies
+                            ? 'Searching emergency types…'
+                            : 'Emergency type',
+                        border: const OutlineInputBorder(),
+                        prefixIcon: const Icon(
+                          Icons.medical_services,
+                          color: _green,
+                        ),
+                      ),
+                      items: emergencyOptions
+                          .map<DropdownMenuItem<String>>((e) {
                         return DropdownMenuItem<String>(
                           value: e['id']?.toString(),
                           child: Text(
@@ -746,7 +893,7 @@ class _HomePageState extends State<HomePage> {
                           ),
                         );
                       }).toList(),
-                      onChanged: submitting
+                      onChanged: (submitting || loadingEmergencies)
                           ? null
                           : (v) {
                               // Clear old hospital before loading the new list
@@ -758,24 +905,60 @@ class _HomePageState extends State<HomePage> {
                                 noHospitals = false;
                                 formError = null;
                                 loadingHospitals = v != null;
+                                hospitalSearchController.clear();
                               });
                               if (v != null) loadSuitableHospitals(v);
                             },
                     ),
                     const SizedBox(height: 12),
+                    TextField(
+                      controller: hospitalSearchController,
+                      enabled: !submitting && emergencyId != null,
+                      textInputAction: TextInputAction.search,
+                      decoration: searchDecoration(
+                        emergencyId == null
+                            ? 'Select emergency type first'
+                            : 'Search hospital (min 3 letters)',
+                      ).copyWith(
+                        suffixIcon: hospitalSearchController.text.isEmpty
+                            ? null
+                            : IconButton(
+                                icon: const Icon(Icons.clear, size: 18),
+                                onPressed: submitting
+                                    ? null
+                                    : () {
+                                        hospitalSearchController.clear();
+                                        onHospitalSearchChanged('');
+                                        setSheetState(() {});
+                                      },
+                              ),
+                      ),
+                      onChanged: (submitting || emergencyId == null)
+                          ? null
+                          : onHospitalSearchChanged,
+                    ),
+                    const SizedBox(height: 8),
                     DropdownButtonFormField<String>(
-                      value: hospitalId,
+                      value: hospitalValue,
                       isExpanded: true,
                       decoration: InputDecoration(
-                        labelText: loadingHospitals ? 'Loading hospitals…' : 'Hospital',
+                        labelText: loadingHospitals
+                            ? 'Loading hospitals…'
+                            : 'Hospital',
                         border: const OutlineInputBorder(),
-                        prefixIcon: const Icon(Icons.local_hospital, color: _green),
+                        prefixIcon: const Icon(
+                          Icons.local_hospital,
+                          color: _green,
+                        ),
                       ),
-                      items: suitableHospitals.map<DropdownMenuItem<String>>((h) {
+                      items: suitableHospitals
+                          .map<DropdownMenuItem<String>>((h) {
                         final id = h['id']?.toString();
-                        final distance = double.tryParse(h['distanceKm']?.toString() ?? '');
+                        final distance =
+                            double.tryParse(h['distanceKm']?.toString() ?? '');
                         final name = h['name']?.toString() ?? 'Hospital';
-                        final isRecommended = id != null && id == recommendedHospitalId;
+                        final isRecommended =
+                            id != null && id == recommendedHospitalId;
                         final caters = h['catersSelectedEmergency'] == true;
 
                         Widget badge(String label, Color color) => Container(
@@ -809,12 +992,18 @@ class _HomePageState extends State<HomePage> {
                                 ),
                               ),
                               if (isRecommended) badge('Recommended', _green),
-                              if (caters) badge('Caters this emergency', Colors.blue.shade700),
+                              if (caters)
+                                badge(
+                                  'Caters this emergency',
+                                  Colors.blue.shade700,
+                                ),
                             ],
                           ),
                         );
                       }).toList(),
-                      onChanged: (submitting || loadingHospitals || suitableHospitals.isEmpty)
+                      onChanged: (submitting ||
+                              loadingHospitals ||
+                              suitableHospitals.isEmpty)
                           ? null
                           : (v) => setSheetState(() => hospitalId = v),
                     ),
@@ -824,6 +1013,20 @@ class _HomePageState extends State<HomePage> {
                         'No hospital caters this emergency type in the selected city.',
                         style: TextStyle(
                           color: Colors.red,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                    if (!noHospitals &&
+                        hospitalSearchController.text.trim().length >= 3 &&
+                        suitableHospitals.isEmpty &&
+                        !loadingHospitals) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'No hospitals match “${hospitalSearchController.text.trim()}”.',
+                        style: TextStyle(
+                          color: Colors.grey.shade700,
                           fontWeight: FontWeight.w600,
                           fontSize: 13,
                         ),
@@ -1063,9 +1266,15 @@ class _HomePageState extends State<HomePage> {
       },
     );
 
-    // The sheet's closing animation still rebuilds the TextField for a few
+    emergencySearchDebounce?.cancel();
+    hospitalSearchDebounce?.cancel();
+    // The sheet's closing animation still rebuilds TextFields for a few
     // frames after the future completes, so defer disposal until it's done.
-    Future<void>.delayed(const Duration(seconds: 1), notesController.dispose);
+    Future<void>.delayed(const Duration(seconds: 1), () {
+      notesController.dispose();
+      emergencySearchController.dispose();
+      hospitalSearchController.dispose();
+    });
   }
 
   Future<void> _submitCorridorRequest({

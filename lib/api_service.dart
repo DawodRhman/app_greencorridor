@@ -305,27 +305,36 @@ class ApiService {
     return '$fallback (${res.statusCode})';
   }
 
-  Future<List<dynamic>> fetchHospitals(String cityId) async {
-    final res = await _authGet(Uri.parse('$_baseUrl/hospitals?cityId=$cityId'));
+  Future<List<dynamic>> fetchHospitals(String cityId, {String? q}) async {
+    final params = <String, String>{'cityId': cityId};
+    final query = q?.trim() ?? '';
+    if (query.length >= 3) params['q'] = query;
+    final uri = Uri.parse('$_baseUrl/hospitals').replace(queryParameters: params);
+    final res = await _authGet(uri);
     if (res.statusCode == 200) return json.decode(res.body);
     throw Exception(_parseError(res, 'Failed to load hospitals'));
   }
 
   /// Hospitals that cater the selected emergency type, nearest first.
   /// Response: { recommendedHospitalId, selectionReason, hospitals: [...] }
+  /// Optional [q] (≥3 chars) filters the returned hospital list.
   Future<Map<String, dynamic>> fetchSuitableHospitals({
     required String cityId,
     required String emergencyTypeId,
     required double latitude,
     required double longitude,
+    String? q,
   }) async {
+    final params = <String, String>{
+      'cityId': cityId,
+      'emergencyTypeId': emergencyTypeId,
+      'latitude': latitude.toString(),
+      'longitude': longitude.toString(),
+    };
+    final query = q?.trim() ?? '';
+    if (query.length >= 3) params['q'] = query;
     final uri = Uri.parse('$_baseUrl/hospitals/suitable').replace(
-      queryParameters: {
-        'cityId': cityId,
-        'emergencyTypeId': emergencyTypeId,
-        'latitude': latitude.toString(),
-        'longitude': longitude.toString(),
-      },
+      queryParameters: params,
     );
     final res = await _authGet(uri);
     if (res.statusCode == 200) {
@@ -335,8 +344,15 @@ class ApiService {
     throw Exception(_parseError(res, 'Failed to load suitable hospitals'));
   }
 
-  Future<List<dynamic>> fetchEmergencyTypes() async {
-    final res = await _authGet(Uri.parse('$_baseUrl/emergency-types'));
+  /// Optional [q] (≥3 chars) filters by name / code / description / soft aliases.
+  Future<List<dynamic>> fetchEmergencyTypes({String? q}) async {
+    final query = q?.trim() ?? '';
+    final uri = query.length >= 3
+        ? Uri.parse('$_baseUrl/emergency-types').replace(
+            queryParameters: {'q': query},
+          )
+        : Uri.parse('$_baseUrl/emergency-types');
+    final res = await _authGet(uri);
     if (res.statusCode == 200) return json.decode(res.body);
     throw Exception(_parseError(res, 'Failed to load emergency types'));
   }
